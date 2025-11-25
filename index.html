@@ -273,6 +273,11 @@
                         clockInTime: null,
                         clockOutTime: null,
                         workHistory: [],
+                        schedule: {
+                            openingTime: '09:00',
+                            closingTime: '17:00',
+                            timezone: 'America/Toronto'
+                        },
                         dailyTasks: [
                             { id: 1, task: 'Check emails', completed: false },
                             { id: 2, task: 'Update daily report', completed: false },
@@ -293,6 +298,11 @@
                         clockInTime: null,
                         clockOutTime: null,
                         workHistory: [],
+                        schedule: {
+                            openingTime: '09:00',
+                            closingTime: '17:00',
+                            timezone: 'America/Toronto'
+                        },
                         dailyTasks: [
                             { id: 1, task: 'Check emails', completed: false },
                             { id: 2, task: 'Update daily report', completed: false }
@@ -455,17 +465,93 @@
                 }
             }, [owner, loading]);
 
-            // Prevent closing browser/tab without clocking out
+            // Prevent closing browser/tab without clocking out - Auto clock out on close
             useEffect(() => {
                 if (currentView === 'employeeDashboard' && currentEmployee?.clockedIn) {
                     const handleBeforeUnload = (e) => {
+                        // Show warning
                         e.preventDefault();
-                        e.returnValue = 'You are still clocked in! Please clock out before leaving.';
-                        return 'You are still clocked in! Please clock out before leaving.';
+                        e.returnValue = 'You are still clocked in! If you close this tab, you will be automatically clocked out.';
+                        
+                        // Auto clock-out when the page unloads
+                        const handleUnload = () => {
+                            const now = new Date();
+                            const clockInDate = new Date(currentEmployee.clockInTime);
+                            const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
+                            
+                            // Create work history entry
+                            const workEntry = {
+                                id: Date.now(),
+                                date: now.toISOString(),
+                                clockIn: currentEmployee.clockInTime,
+                                clockOut: now.toISOString(),
+                                hoursWorked: parseFloat(hoursWorked),
+                                autoClockOut: true // Flag for auto clock-out
+                            };
+                            
+                            // Update employee data
+                            const updatedEmployee = {
+                                ...currentEmployee,
+                                clockedIn: false,
+                                clockOutTime: now.toISOString(),
+                                workHistory: [...(currentEmployee.workHistory || []), workEntry],
+                                dailyTasks: currentEmployee.dailyTasks.map(task => ({ ...task, completed: false })),
+                                assignedTasks: currentEmployee.assignedTasks.filter(task => !task.completed)
+                            };
+                            
+                            // Get all employees and update
+                            const allEmployees = Storage.getEmployees();
+                            const updatedEmployees = allEmployees.map(emp =>
+                                emp.id === currentEmployee.id ? updatedEmployee : emp
+                            );
+                            Storage.saveEmployees(updatedEmployees);
+                            
+                            // Clear session
+                            SessionManager.clearSession();
+                        };
+                        
+                        return e.returnValue;
+                    };
+                    
+                    const handleUnload = () => {
+                        if (currentEmployee?.clockedIn) {
+                            const now = new Date();
+                            const clockInDate = new Date(currentEmployee.clockInTime);
+                            const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
+                            
+                            const workEntry = {
+                                id: Date.now(),
+                                date: now.toISOString(),
+                                clockIn: currentEmployee.clockInTime,
+                                clockOut: now.toISOString(),
+                                hoursWorked: parseFloat(hoursWorked),
+                                autoClockOut: true
+                            };
+                            
+                            const updatedEmployee = {
+                                ...currentEmployee,
+                                clockedIn: false,
+                                clockOutTime: now.toISOString(),
+                                workHistory: [...(currentEmployee.workHistory || []), workEntry],
+                                dailyTasks: currentEmployee.dailyTasks.map(task => ({ ...task, completed: false })),
+                                assignedTasks: currentEmployee.assignedTasks.filter(task => !task.completed)
+                            };
+                            
+                            const allEmployees = Storage.getEmployees();
+                            const updatedEmployees = allEmployees.map(emp =>
+                                emp.id === currentEmployee.id ? updatedEmployee : emp
+                            );
+                            Storage.saveEmployees(updatedEmployees);
+                            SessionManager.clearSession();
+                        }
                     };
                     
                     window.addEventListener('beforeunload', handleBeforeUnload);
-                    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+                    window.addEventListener('unload', handleUnload);
+                    return () => {
+                        window.removeEventListener('beforeunload', handleBeforeUnload);
+                        window.removeEventListener('unload', handleUnload);
+                    };
                 }
             }, [currentView, currentEmployee]);
 
@@ -510,13 +596,41 @@
 
             const handleClockIn = () => {
                 const now = new Date();
+                
+                // Check if employee is late
+                let isLate = false;
+                let minutesLate = 0;
+                
+                if (currentEmployee.schedule && currentEmployee.schedule.openingTime) {
+                    const [hours, minutes] = currentEmployee.schedule.openingTime.split(':');
+                    const scheduledTime = new Date(now);
+                    scheduledTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+                    
+                    if (now > scheduledTime) {
+                        isLate = true;
+                        minutesLate = Math.floor((now - scheduledTime) / (1000 * 60));
+                    }
+                }
+                
                 const updatedEmployees = employees.map(emp =>
                     emp.id === currentEmployee.id
-                        ? { ...emp, clockedIn: true, clockInTime: now.toISOString() }
+                        ? { 
+                            ...emp, 
+                            clockedIn: true, 
+                            clockInTime: now.toISOString(),
+                            isLateToday: isLate,
+                            minutesLate: minutesLate
+                        }
                         : emp
                 );
                 setEmployees(updatedEmployees);
-                setCurrentEmployee({ ...currentEmployee, clockedIn: true, clockInTime: now.toISOString() });
+                setCurrentEmployee({ 
+                    ...currentEmployee, 
+                    clockedIn: true, 
+                    clockInTime: now.toISOString(),
+                    isLateToday: isLate,
+                    minutesLate: minutesLate
+                });
             };
 
             const handleClockOut = () => {
@@ -532,13 +646,15 @@
                 const clockInDate = new Date(currentEmployee.clockInTime);
                 const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
                 
-                // Create work history entry
+                // Create work history entry with late status
                 const workEntry = {
                     id: Date.now(),
                     date: now.toISOString(),
                     clockIn: currentEmployee.clockInTime,
                     clockOut: now.toISOString(),
-                    hoursWorked: parseFloat(hoursWorked)
+                    hoursWorked: parseFloat(hoursWorked),
+                    wasLate: currentEmployee.isLateToday || false,
+                    minutesLate: currentEmployee.minutesLate || 0
                 };
                 
                 const updatedEmployees = employees.map(emp =>
@@ -549,7 +665,9 @@
                             clockOutTime: now.toISOString(),
                             workHistory: [...(emp.workHistory || []), workEntry],
                             dailyTasks: emp.dailyTasks.map(task => ({ ...task, completed: false })),
-                            assignedTasks: emp.assignedTasks.filter(task => !task.completed)
+                            assignedTasks: emp.assignedTasks.filter(task => !task.completed),
+                            isLateToday: false,
+                            minutesLate: 0
                         }
                         : emp
                 );
@@ -560,7 +678,9 @@
                     clockOutTime: now.toISOString(),
                     workHistory: [...(currentEmployee.workHistory || []), workEntry],
                     dailyTasks: currentEmployee.dailyTasks.map(task => ({ ...task, completed: false })),
-                    assignedTasks: currentEmployee.assignedTasks.filter(task => !task.completed)
+                    assignedTasks: currentEmployee.assignedTasks.filter(task => !task.completed),
+                    isLateToday: false,
+                    minutesLate: 0
                 });
                 setError('');
             };
@@ -616,6 +736,11 @@
                         clockInTime: null,
                         clockOutTime: null,
                         workHistory: [],
+                        schedule: {
+                            openingTime: '09:00',
+                            closingTime: '17:00',
+                            timezone: 'America/Toronto'
+                        },
                         dailyTasks: [],
                         assignedTasks: []
                     };
@@ -862,6 +987,23 @@
                 
                 setEmployees(updatedEmployees);
                 setEditingWorkEntry(null);
+            };
+            
+            // Delete work history entry
+            const handleDeleteWorkEntry = (employeeId, entryId) => {
+                if (confirm('Are you sure you want to delete this work session? This action cannot be undone.')) {
+                    const updatedEmployees = employees.map(emp => {
+                        if (emp.id === employeeId) {
+                            return {
+                                ...emp,
+                                workHistory: emp.workHistory.filter(entry => entry.id !== entryId)
+                            };
+                        }
+                        return emp;
+                    });
+                    
+                    setEmployees(updatedEmployees);
+                }
             };
             
             // Export employee work history to PDF
@@ -1365,7 +1507,7 @@
                                                                                         </div>
                                                                                     ) : (
                                                                                         <div className="flex justify-between items-center">
-                                                                                            <div className="flex gap-6 text-sm">
+                                                                                            <div className="flex gap-6 text-sm items-center flex-wrap">
                                                                                                 <span className="text-slate-400">
                                                                                                     Clock In: <span className="text-green-400 font-medium">
                                                                                                         {new Date(entry.clockIn).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}
@@ -1377,20 +1519,41 @@
                                                                                                     </span>
                                                                                                 </span>
                                                                                                 <span className="text-white font-semibold">{entry.hoursWorked.toFixed(2)} hrs</span>
+                                                                                                {entry.wasLate && (
+                                                                                                    <span className="px-2 py-1 bg-amber-500/20 border border-amber-500/50 text-amber-400 rounded text-xs font-medium flex items-center gap-1">
+                                                                                                        <AlertCircle size={12} />
+                                                                                                        Late by {entry.minutesLate} min
+                                                                                                    </span>
+                                                                                                )}
+                                                                                                {entry.autoClockOut && (
+                                                                                                    <span className="px-2 py-1 bg-blue-500/20 border border-blue-500/50 text-blue-400 rounded text-xs font-medium">
+                                                                                                        Auto Clock-Out
+                                                                                                    </span>
+                                                                                                )}
                                                                                             </div>
-                                                                                            <button
-                                                                                                onClick={() => {
-                                                                                                    setEditingWorkEntry(entry.id);
-                                                                                                    setEditingWorkTimes({ 
-                                                                                                        clockIn: new Date(entry.clockIn).toISOString().slice(0, 16), 
-                                                                                                        clockOut: new Date(entry.clockOut).toISOString().slice(0, 16) 
-                                                                                                    });
-                                                                                                }}
-                                                                                                className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors text-sm flex items-center gap-1"
-                                                                                            >
-                                                                                                <Edit2 size={14} />
-                                                                                                Edit
-                                                                                            </button>
+                                                                                            <div className="flex gap-2">
+                                                                                                <button
+                                                                                                    onClick={() => {
+                                                                                                        setEditingWorkEntry(entry.id);
+                                                                                                        setEditingWorkTimes({ 
+                                                                                                            clockIn: new Date(entry.clockIn).toISOString().slice(0, 16), 
+                                                                                                            clockOut: new Date(entry.clockOut).toISOString().slice(0, 16) 
+                                                                                                        });
+                                                                                                    }}
+                                                                                                    className="px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded transition-colors text-sm flex items-center gap-1"
+                                                                                                >
+                                                                                                    <Edit2 size={14} />
+                                                                                                    Edit
+                                                                                                </button>
+                                                                                                <button
+                                                                                                    onClick={() => handleDeleteWorkEntry(employee.id, entry.id)}
+                                                                                                    className="px-3 py-1 bg-red-600 hover:bg-red-500 text-white rounded transition-colors text-sm flex items-center gap-1"
+                                                                                                    title="Delete this work session"
+                                                                                                >
+                                                                                                    <Trash2 size={14} />
+                                                                                                    Delete
+                                                                                                </button>
+                                                                                            </div>
                                                                                         </div>
                                                                                     )}
                                                                                 </div>
@@ -1479,7 +1642,8 @@
                                                                         onClick={() => handleUpdateEmployee(employee.id, {
                                                                             username: employee.tempUsername || employee.username,
                                                                             password: employee.tempPassword || employee.password,
-                                                                            allowedIPs: employee.tempAllowedIPs !== undefined ? employee.tempAllowedIPs : employee.allowedIPs
+                                                                            allowedIPs: employee.tempAllowedIPs !== undefined ? employee.tempAllowedIPs : employee.allowedIPs,
+                                                                            schedule: employee.tempSchedule || employee.schedule || { openingTime: '09:00', closingTime: '17:00', timezone: 'America/Toronto' }
                                                                         })}
                                                                         className="px-3 py-1 bg-green-600 hover:bg-green-500 text-white rounded transition-colors"
                                                                     >
@@ -1510,6 +1674,90 @@
                                                                         Employee can only login from these IP addresses. Leave empty to allow from anywhere.
                                                                     </p>
                                                                 </div>
+                                                                
+                                                                <div className="bg-slate-900/30 p-3 rounded-lg">
+                                                                    <label className="text-slate-300 text-xs font-semibold mb-2 block">
+                                                                        Work Schedule
+                                                                    </label>
+                                                                    <div className="grid grid-cols-3 gap-3">
+                                                                        <div>
+                                                                            <label className="text-slate-400 text-xs mb-1 block">Opening Time</label>
+                                                                            <input
+                                                                                type="time"
+                                                                                defaultValue={employee.schedule?.openingTime || '09:00'}
+                                                                                onChange={(e) => {
+                                                                                    if (!employee.tempSchedule) employee.tempSchedule = { ...employee.schedule };
+                                                                                    employee.tempSchedule.openingTime = e.target.value;
+                                                                                }}
+                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
+                                                                            />
+                                                                        </div>
+                                                                        <div>
+                                                                            <label className="text-slate-400 text-xs mb-1 block">Closing Time</label>
+                                                                            <input
+                                                                                type="time"
+                                                                                defaultValue={employee.schedule?.closingTime || '17:00'}
+                                                                                onChange={(e) => {
+                                                                                    if (!employee.tempSchedule) employee.tempSchedule = { ...employee.schedule };
+                                                                                    employee.tempSchedule.closingTime = e.target.value;
+                                                                                }}
+                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
+                                                                            />
+                                                                        </div>
+                                                                        <div>
+                                                                            <label className="text-slate-400 text-xs mb-1 block">Timezone</label>
+                                                                            <select
+                                                                                defaultValue={employee.schedule?.timezone || 'America/Toronto'}
+                                                                                onChange={(e) => {
+                                                                                    if (!employee.tempSchedule) employee.tempSchedule = { ...employee.schedule };
+                                                                                    employee.tempSchedule.timezone = e.target.value;
+                                                                                }}
+                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
+                                                                            >
+                                                                                <optgroup label="🇨🇦 Canada">
+                                                                                    <option value="America/St_Johns">Newfoundland Time (NST)</option>
+                                                                                    <option value="America/Halifax">Atlantic Time (AST)</option>
+                                                                                    <option value="America/Toronto">Eastern Time (EST/EDT)</option>
+                                                                                    <option value="America/Winnipeg">Central Time (CST/CDT)</option>
+                                                                                    <option value="America/Regina">Saskatchewan (CST)</option>
+                                                                                    <option value="America/Edmonton">Mountain Time (MST/MDT)</option>
+                                                                                    <option value="America/Vancouver">Pacific Time (PST/PDT)</option>
+                                                                                </optgroup>
+                                                                                <optgroup label="🇺🇸 United States">
+                                                                                    <option value="America/New_York">Eastern Time (EST/EDT)</option>
+                                                                                    <option value="America/Chicago">Central Time (CST/CDT)</option>
+                                                                                    <option value="America/Denver">Mountain Time (MST/MDT)</option>
+                                                                                    <option value="America/Phoenix">Arizona (MST)</option>
+                                                                                    <option value="America/Los_Angeles">Pacific Time (PST/PDT)</option>
+                                                                                    <option value="America/Anchorage">Alaska Time (AKST/AKDT)</option>
+                                                                                    <option value="Pacific/Honolulu">Hawaii Time (HST)</option>
+                                                                                </optgroup>
+                                                                                <optgroup label="🇮🇳 India">
+                                                                                    <option value="Asia/Kolkata">India Standard Time (IST)</option>
+                                                                                </optgroup>
+                                                                                <optgroup label="🇦🇺 Australia">
+                                                                                    <option value="Australia/Perth">Western Australia (AWST)</option>
+                                                                                    <option value="Australia/Darwin">Northern Territory (ACST)</option>
+                                                                                    <option value="Australia/Adelaide">South Australia (ACST/ACDT)</option>
+                                                                                    <option value="Australia/Brisbane">Queensland (AEST)</option>
+                                                                                    <option value="Australia/Sydney">New South Wales (AEST/AEDT)</option>
+                                                                                    <option value="Australia/Melbourne">Victoria (AEST/AEDT)</option>
+                                                                                    <option value="Australia/Hobart">Tasmania (AEST/AEDT)</option>
+                                                                                </optgroup>
+                                                                                <optgroup label="🇳🇿 New Zealand">
+                                                                                    <option value="Pacific/Auckland">New Zealand (NZST/NZDT)</option>
+                                                                                    <option value="Pacific/Chatham">Chatham Islands (CHAST/CHADT)</option>
+                                                                                </optgroup>
+                                                                                <optgroup label="🇬🇧 United Kingdom">
+                                                                                    <option value="Europe/London">UK Time (GMT/BST)</option>
+                                                                                </optgroup>
+                                                                            </select>
+                                                                        </div>
+                                                                    </div>
+                                                                    <p className="text-slate-500 text-xs mt-2">
+                                                                        Set the expected work hours. Late clock-ins will be tracked.
+                                                                    </p>
+                                                                </div>
                                                             </div>
                                                         ) : (
                                                             <>
@@ -1527,6 +1775,12 @@
                                                                     >
                                                                         {showPassword[employee.id] ? <EyeOff size={16} /> : <Eye size={16} />}
                                                                     </button>
+                                                                </span>
+                                                                <span className="text-slate-400 w-full">
+                                                                    Work Hours: 
+                                                                    <span className="text-white font-medium ml-2">
+                                                                        {employee.schedule?.openingTime || '09:00'} - {employee.schedule?.closingTime || '17:00'} ({employee.schedule?.timezone || 'America/Toronto'})
+                                                                    </span>
                                                                 </span>
                                                                 <span className="text-slate-400 w-full">
                                                                     Allowed IPs: 
@@ -2102,6 +2356,60 @@
             if (currentView === 'employeeDashboard') {
                 const allDailyTasksCompleted = currentEmployee.dailyTasks.every(task => task.completed);
                 
+                // Auto clock-out at closing time
+                useEffect(() => {
+                    if (currentEmployee?.clockedIn && currentEmployee?.schedule?.closingTime) {
+                        const checkClosingTime = () => {
+                            const now = new Date();
+                            const [hours, minutes] = currentEmployee.schedule.closingTime.split(':');
+                            const closingTime = new Date(now);
+                            closingTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+                            
+                            // If current time is past closing time
+                            if (now >= closingTime) {
+                                // Auto clock out
+                                const clockInDate = new Date(currentEmployee.clockInTime);
+                                const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
+                                
+                                const workEntry = {
+                                    id: Date.now(),
+                                    date: now.toISOString(),
+                                    clockIn: currentEmployee.clockInTime,
+                                    clockOut: now.toISOString(),
+                                    hoursWorked: parseFloat(hoursWorked),
+                                    wasLate: currentEmployee.isLateToday || false,
+                                    minutesLate: currentEmployee.minutesLate || 0,
+                                    autoClockOut: true,
+                                    reason: 'Closing time reached'
+                                };
+                                
+                                const updatedEmployees = employees.map(emp =>
+                                    emp.id === currentEmployee.id
+                                        ? { 
+                                            ...emp, 
+                                            clockedIn: false, 
+                                            clockOutTime: now.toISOString(),
+                                            workHistory: [...(emp.workHistory || []), workEntry],
+                                            dailyTasks: emp.dailyTasks.map(task => ({ ...task, completed: false })),
+                                            assignedTasks: emp.assignedTasks.filter(task => !task.completed),
+                                            isLateToday: false,
+                                            minutesLate: 0
+                                        }
+                                        : emp
+                                );
+                                setEmployees(updatedEmployees);
+                                setError('You have been automatically clocked out as closing time has been reached.');
+                            }
+                        };
+                        
+                        // Check every minute
+                        const interval = setInterval(checkClosingTime, 60000);
+                        checkClosingTime(); // Check immediately
+                        
+                        return () => clearInterval(interval);
+                    }
+                }, [currentEmployee, employees]);
+                
                 return (
                     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
                         <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(120,119,198,0.1),transparent)]"></div>
@@ -2127,6 +2435,20 @@
                                 <div className="bg-red-500/10 border border-red-500/50 text-red-400 px-4 py-3 rounded-lg mb-6 flex items-center gap-2">
                                     <AlertCircle size={18} />
                                     {error}
+                                </div>
+                            )}
+                            
+                            {/* Late Arrival Alert */}
+                            {currentEmployee.clockedIn && currentEmployee.isLateToday && (
+                                <div className="bg-amber-500/10 border border-amber-500/50 text-amber-400 px-4 py-3 rounded-lg mb-6 flex items-center gap-3">
+                                    <AlertCircle size={20} className="flex-shrink-0" />
+                                    <div>
+                                        <p className="font-semibold">Late Clock-In</p>
+                                        <p className="text-sm">
+                                            You clocked in {currentEmployee.minutesLate} minute{currentEmployee.minutesLate !== 1 ? 's' : ''} late. 
+                                            Expected time: {currentEmployee.schedule?.openingTime || '09:00'}
+                                        </p>
+                                    </div>
                                 </div>
                             )}
 
