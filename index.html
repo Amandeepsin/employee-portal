@@ -464,6 +464,60 @@
                     Storage.saveOwner(owner);
                 }
             }, [owner, loading]);
+            
+            // Auto clock-out at closing time
+            useEffect(() => {
+                if (currentView === 'employeeDashboard' && currentEmployee?.clockedIn && currentEmployee?.schedule?.closingTime) {
+                    const checkClosingTime = () => {
+                        const now = new Date();
+                        const [hours, minutes] = currentEmployee.schedule.closingTime.split(':');
+                        const closingTime = new Date(now);
+                        closingTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+                        
+                        // If current time is past closing time
+                        if (now >= closingTime) {
+                            // Auto clock out
+                            const clockInDate = new Date(currentEmployee.clockInTime);
+                            const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
+                            
+                            const workEntry = {
+                                id: Date.now(),
+                                date: now.toISOString(),
+                                clockIn: currentEmployee.clockInTime,
+                                clockOut: now.toISOString(),
+                                hoursWorked: parseFloat(hoursWorked),
+                                wasLate: currentEmployee.isLateToday || false,
+                                minutesLate: currentEmployee.minutesLate || 0,
+                                autoClockOut: true,
+                                reason: 'Closing time reached'
+                            };
+                            
+                            const updatedEmployees = employees.map(emp =>
+                                emp.id === currentEmployee.id
+                                    ? { 
+                                        ...emp, 
+                                        clockedIn: false, 
+                                        clockOutTime: now.toISOString(),
+                                        workHistory: [...(emp.workHistory || []), workEntry],
+                                        dailyTasks: emp.dailyTasks.map(task => ({ ...task, completed: false })),
+                                        assignedTasks: emp.assignedTasks.filter(task => !task.completed),
+                                        isLateToday: false,
+                                        minutesLate: 0
+                                    }
+                                    : emp
+                            );
+                            setEmployees(updatedEmployees);
+                            setError('You have been automatically clocked out as closing time has been reached.');
+                        }
+                    };
+                    
+                    // Check every minute
+                    const interval = setInterval(checkClosingTime, 60000);
+                    checkClosingTime(); // Check immediately
+                    
+                    return () => clearInterval(interval);
+                }
+            }, [currentView, currentEmployee, employees]);
 
             // Prevent closing browser/tab without clocking out - Auto clock out on close
             useEffect(() => {
@@ -2355,60 +2409,6 @@
             // Employee Dashboard
             if (currentView === 'employeeDashboard') {
                 const allDailyTasksCompleted = currentEmployee.dailyTasks.every(task => task.completed);
-                
-                // Auto clock-out at closing time
-                useEffect(() => {
-                    if (currentEmployee?.clockedIn && currentEmployee?.schedule?.closingTime) {
-                        const checkClosingTime = () => {
-                            const now = new Date();
-                            const [hours, minutes] = currentEmployee.schedule.closingTime.split(':');
-                            const closingTime = new Date(now);
-                            closingTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
-                            
-                            // If current time is past closing time
-                            if (now >= closingTime) {
-                                // Auto clock out
-                                const clockInDate = new Date(currentEmployee.clockInTime);
-                                const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
-                                
-                                const workEntry = {
-                                    id: Date.now(),
-                                    date: now.toISOString(),
-                                    clockIn: currentEmployee.clockInTime,
-                                    clockOut: now.toISOString(),
-                                    hoursWorked: parseFloat(hoursWorked),
-                                    wasLate: currentEmployee.isLateToday || false,
-                                    minutesLate: currentEmployee.minutesLate || 0,
-                                    autoClockOut: true,
-                                    reason: 'Closing time reached'
-                                };
-                                
-                                const updatedEmployees = employees.map(emp =>
-                                    emp.id === currentEmployee.id
-                                        ? { 
-                                            ...emp, 
-                                            clockedIn: false, 
-                                            clockOutTime: now.toISOString(),
-                                            workHistory: [...(emp.workHistory || []), workEntry],
-                                            dailyTasks: emp.dailyTasks.map(task => ({ ...task, completed: false })),
-                                            assignedTasks: emp.assignedTasks.filter(task => !task.completed),
-                                            isLateToday: false,
-                                            minutesLate: 0
-                                        }
-                                        : emp
-                                );
-                                setEmployees(updatedEmployees);
-                                setError('You have been automatically clocked out as closing time has been reached.');
-                            }
-                        };
-                        
-                        // Check every minute
-                        const interval = setInterval(checkClosingTime, 60000);
-                        checkClosingTime(); // Check immediately
-                        
-                        return () => clearInterval(interval);
-                    }
-                }, [currentEmployee, employees]);
                 
                 return (
                     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
