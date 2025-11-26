@@ -413,7 +413,7 @@
             const [error, setError] = useState('');
             const [editingEmployee, setEditingEmployee] = useState(null);
             const [showPassword, setShowPassword] = useState({});
-            const [newEmployee, setNewEmployee] = useState({ username: '', password: '', name: '' });
+            const [newEmployee, setNewEmployee] = useState({ username: '', password: '', name: '', phone: '', email: '', idDocument: null });
             const [editingDailyTasks, setEditingDailyTasks] = useState(null);
             const [newDailyTask, setNewDailyTask] = useState('');
             const [newAssignedTask, setNewAssignedTask] = useState('');
@@ -900,6 +900,9 @@
                         username: newEmployee.username,
                         password: newEmployee.password,
                         name: newEmployee.name,
+                        phone: newEmployee.phone || '',
+                        email: newEmployee.email || '',
+                        idDocument: newEmployee.idDocument || null,
                         allowedIPs: [],
                         clockedIn: false,
                         clockInTime: null,
@@ -921,7 +924,30 @@
                         isPaused: false
                     };
                     setEmployees([...employees, employee]);
-                    setNewEmployee({ username: '', password: '', name: '' });
+                    setNewEmployee({ username: '', password: '', name: '', phone: '', email: '', idDocument: null });
+                }
+            };
+            
+            const handleFileUpload = (e, employeeId = null) => {
+                const file = e.target.files[0];
+                if (file && file.type === 'application/pdf') {
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                        const base64 = event.target.result;
+                        if (employeeId) {
+                            // Update existing employee
+                            const updatedEmployees = employees.map(emp =>
+                                emp.id === employeeId ? { ...emp, idDocument: { name: file.name, data: base64 } } : emp
+                            );
+                            setEmployees(updatedEmployees);
+                        } else {
+                            // For new employee
+                            setNewEmployee({ ...newEmployee, idDocument: { name: file.name, data: base64 } });
+                        }
+                    };
+                    reader.readAsDataURL(file);
+                } else {
+                    alert('Please upload a PDF file only');
                 }
             };
 
@@ -2085,6 +2111,8 @@
                                                                         onClick={() => handleUpdateEmployee(employee.id, {
                                                                             username: employee.tempUsername || employee.username,
                                                                             password: employee.tempPassword || employee.password,
+                                                                            phone: employee.tempPhone !== undefined ? employee.tempPhone : employee.phone,
+                                                                            email: employee.tempEmail !== undefined ? employee.tempEmail : employee.email,
                                                                             allowedIPs: employee.tempAllowedIPs !== undefined ? employee.tempAllowedIPs : employee.allowedIPs,
                                                                             schedule: employee.tempSchedule || employee.schedule || { openingTime: '09:00', closingTime: '17:00', timezone: 'America/Toronto' },
                                                                             assignedBreakMinutes: employee.tempBreakMinutes !== undefined ? employee.tempBreakMinutes : employee.assignedBreakMinutes
@@ -2100,6 +2128,50 @@
                                                                         <X size={16} />
                                                                     </button>
                                                                 </div>
+                                                                
+                                                                <div className="bg-slate-900/30 p-3 rounded-lg">
+                                                                    <label className="text-slate-300 text-xs font-semibold mb-2 block">
+                                                                        Contact Information
+                                                                    </label>
+                                                                    <div className="grid grid-cols-2 gap-3">
+                                                                        <div>
+                                                                            <label className="text-slate-400 text-xs mb-1 block">Phone Number</label>
+                                                                            <input
+                                                                                type="tel"
+                                                                                defaultValue={employee.phone || ''}
+                                                                                onChange={(e) => employee.tempPhone = e.target.value}
+                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
+                                                                                placeholder="Phone number"
+                                                                            />
+                                                                        </div>
+                                                                        <div>
+                                                                            <label className="text-slate-400 text-xs mb-1 block">Email Address</label>
+                                                                            <input
+                                                                                type="email"
+                                                                                defaultValue={employee.email || ''}
+                                                                                onChange={(e) => employee.tempEmail = e.target.value}
+                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
+                                                                                placeholder="Email address"
+                                                                            />
+                                                                        </div>
+                                                                    </div>
+                                                                </div>
+                                                                
+                                                                <div className="bg-slate-900/30 p-3 rounded-lg">
+                                                                    <label className="text-slate-300 text-xs font-semibold mb-2 block">
+                                                                        ID Document (PDF)
+                                                                    </label>
+                                                                    <input
+                                                                        type="file"
+                                                                        accept=".pdf"
+                                                                        onChange={(e) => handleFileUpload(e, employee.id)}
+                                                                        className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm file:mr-4 file:py-1 file:px-3 file:rounded file:border-0 file:bg-amber-500 file:text-white file:cursor-pointer hover:file:bg-amber-400"
+                                                                    />
+                                                                    {employee.idDocument && (
+                                                                        <p className="text-green-400 text-xs mt-2">✓ {employee.idDocument.name}</p>
+                                                                    )}
+                                                                </div>
+                                                                
                                                                 <div className="bg-slate-900/30 p-3 rounded-lg">
                                                                     <label className="text-slate-300 text-xs font-semibold mb-2 block">
                                                                         Allowed IP Addresses (comma-separated)
@@ -2256,6 +2328,33 @@
                                                                             ? employee.allowedIPs.join(', ') 
                                                                             : 'No restriction (can login from anywhere)'}
                                                                     </span>
+                                                                </span>
+                                                                <span className="text-slate-400 w-full">
+                                                                    Phone: 
+                                                                    <span className="text-white font-medium ml-2">
+                                                                        {employee.phone || 'Not provided'}
+                                                                    </span>
+                                                                </span>
+                                                                <span className="text-slate-400 w-full">
+                                                                    Email: 
+                                                                    <span className="text-white font-medium ml-2">
+                                                                        {employee.email || 'Not provided'}
+                                                                    </span>
+                                                                </span>
+                                                                <span className="text-slate-400 w-full">
+                                                                    ID Document: 
+                                                                    {employee.idDocument ? (
+                                                                        <a 
+                                                                            href={employee.idDocument.data} 
+                                                                            download={employee.idDocument.name}
+                                                                            className="text-blue-400 hover:text-blue-300 ml-2 inline-flex items-center gap-1"
+                                                                        >
+                                                                            <Download size={16} />
+                                                                            {employee.idDocument.name}
+                                                                        </a>
+                                                                    ) : (
+                                                                        <span className="text-white font-medium ml-2">Not uploaded</span>
+                                                                    )}
                                                                 </span>
                                                             </>
                                                         )}
