@@ -158,6 +158,16 @@
             </svg>
         );
         
+        const Coffee = ({ size = 24, className = "" }) => (
+            <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                <path d="M18 8h1a4 4 0 0 1 0 8h-1"></path>
+                <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"></path>
+                <line x1="6" y1="1" x2="6" y2="4"></line>
+                <line x1="10" y1="1" x2="10" y2="4"></line>
+                <line x1="14" y1="1" x2="14" y2="4"></line>
+            </svg>
+        );
+        
         const ChevronUp = ({ size = 24, className = "" }) => (
             <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
                 <polyline points="18 15 12 9 6 15"></polyline>
@@ -286,7 +296,14 @@
                         assignedTasks: [
                             { id: 1, task: 'Complete project documentation', completed: false },
                             { id: 2, task: 'Review code submissions', completed: false }
-                        ]
+                        ],
+                        notes: '',
+                        assignedBreakMinutes: 30, // Break time assigned by owner
+                        onBreak: false,
+                        breakStartTime: null,
+                        breakPausedTime: null,
+                        breakTimeUsed: 0, // Minutes of break time used
+                        isPaused: false
                     },
                     {
                         id: 2,
@@ -309,7 +326,14 @@
                         ],
                         assignedTasks: [
                             { id: 1, task: 'Client presentation prep', completed: false }
-                        ]
+                        ],
+                        notes: '',
+                        assignedBreakMinutes: 60, // Break time assigned by owner
+                        onBreak: false,
+                        breakStartTime: null,
+                        breakPausedTime: null,
+                        breakTimeUsed: 0,
+                        isPaused: false
                     }
                 ];
             },
@@ -404,6 +428,15 @@
             // State for editing task text
             const [editingTaskId, setEditingTaskId] = useState(null);
             const [editingTaskText, setEditingTaskText] = useState('');
+            
+            // State for notes save status
+            const [notesSaveStatus, setNotesSaveStatus] = useState('saved'); // 'saved', 'saving'
+            
+            // State for break timer
+            const [breakTimeRemaining, setBreakTimeRemaining] = useState(0);
+            
+            // State for selected employee in sidebar layout
+            const [selectedEmployee, setSelectedEmployee] = useState(null);
 
             // Check for existing session on mount
             useEffect(() => {
@@ -465,59 +498,27 @@
                 }
             }, [owner, loading]);
             
-            // Auto clock-out at closing time
+            // Break timer - auto end when time runs out
             useEffect(() => {
-                if (currentView === 'employeeDashboard' && currentEmployee?.clockedIn && currentEmployee?.schedule?.closingTime) {
-                    const checkClosingTime = () => {
+                if (currentView === 'employeeDashboard' && currentEmployee?.onBreak && !currentEmployee?.isPaused) {
+                    const interval = setInterval(() => {
                         const now = new Date();
-                        const [hours, minutes] = currentEmployee.schedule.closingTime.split(':');
-                        const closingTime = new Date(now);
-                        closingTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+                        const breakStart = new Date(currentEmployee.breakStartTime);
+                        const timeElapsed = (now - breakStart) / (1000 * 60); // minutes
+                        const totalUsed = (currentEmployee.breakTimeUsed || 0) + timeElapsed;
+                        const remaining = (currentEmployee.assignedBreakMinutes || 30) - totalUsed;
                         
-                        // If current time is past closing time
-                        if (now >= closingTime) {
-                            // Auto clock out
-                            const clockInDate = new Date(currentEmployee.clockInTime);
-                            const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
-                            
-                            const workEntry = {
-                                id: Date.now(),
-                                date: now.toISOString(),
-                                clockIn: currentEmployee.clockInTime,
-                                clockOut: now.toISOString(),
-                                hoursWorked: parseFloat(hoursWorked),
-                                wasLate: currentEmployee.isLateToday || false,
-                                minutesLate: currentEmployee.minutesLate || 0,
-                                autoClockOut: true,
-                                reason: 'Closing time reached'
-                            };
-                            
-                            const updatedEmployees = employees.map(emp =>
-                                emp.id === currentEmployee.id
-                                    ? { 
-                                        ...emp, 
-                                        clockedIn: false, 
-                                        clockOutTime: now.toISOString(),
-                                        workHistory: [...(emp.workHistory || []), workEntry],
-                                        dailyTasks: emp.dailyTasks.map(task => ({ ...task, completed: false })),
-                                        assignedTasks: emp.assignedTasks.filter(task => !task.completed),
-                                        isLateToday: false,
-                                        minutesLate: 0
-                                    }
-                                    : emp
-                            );
-                            setEmployees(updatedEmployees);
-                            setError('You have been automatically clocked out as closing time has been reached.');
+                        setBreakTimeRemaining(Math.max(0, remaining));
+                        
+                        // Auto end break when time runs out
+                        if (remaining <= 0) {
+                            handleEndBreak();
                         }
-                    };
-                    
-                    // Check every minute
-                    const interval = setInterval(checkClosingTime, 60000);
-                    checkClosingTime(); // Check immediately
+                    }, 1000); // Update every second
                     
                     return () => clearInterval(interval);
                 }
-            }, [currentView, currentEmployee, employees]);
+            }, [currentView, currentEmployee]);
 
             // Prevent closing browser/tab without clocking out - Auto clock out on close
             useEffect(() => {
@@ -683,7 +684,8 @@
                     clockedIn: true, 
                     clockInTime: now.toISOString(),
                     isLateToday: isLate,
-                    minutesLate: minutesLate
+                    minutesLate: minutesLate,
+                    hasBeenAutoClocked: false
                 });
             };
 
@@ -698,15 +700,21 @@
 
                 const now = new Date();
                 const clockInDate = new Date(currentEmployee.clockInTime);
-                const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
+                const totalMinutesWorked = (now - clockInDate) / (1000 * 60);
                 
-                // Create work history entry with late status
+                // Always deduct assigned break time from total hours
+                const assignedBreakMinutes = currentEmployee.assignedBreakMinutes || 30;
+                const netWorkMinutes = totalMinutesWorked - assignedBreakMinutes;
+                const hoursWorked = (netWorkMinutes / 60).toFixed(2);
+                
+                // Create work history entry
                 const workEntry = {
                     id: Date.now(),
                     date: now.toISOString(),
                     clockIn: currentEmployee.clockInTime,
                     clockOut: now.toISOString(),
                     hoursWorked: parseFloat(hoursWorked),
+                    assignedBreakMinutes: assignedBreakMinutes,
                     wasLate: currentEmployee.isLateToday || false,
                     minutesLate: currentEmployee.minutesLate || 0
                 };
@@ -719,9 +727,13 @@
                             clockOutTime: now.toISOString(),
                             workHistory: [...(emp.workHistory || []), workEntry],
                             dailyTasks: emp.dailyTasks.map(task => ({ ...task, completed: false })),
-                            assignedTasks: emp.assignedTasks.filter(task => !task.completed),
                             isLateToday: false,
-                            minutesLate: 0
+                            minutesLate: 0,
+                            onBreak: false,
+                            breakStartTime: null,
+                            breakPausedTime: null,
+                            breakTimeUsed: 0,
+                            isPaused: false
                         }
                         : emp
                 );
@@ -740,15 +752,101 @@
             };
 
             const handleEmployeeSignOut = () => {
+                // Show warning if employee is still clocked in
                 if (currentEmployee?.clockedIn) {
-                    setError('Please clock out before signing out!');
-                    setTimeout(() => setError(''), 4000);
-                    return;
+                    const confirmed = confirm(
+                        '⚠️ Warning: You are still clocked in!\n\n' +
+                        'If you sign out now, your clock-in session will remain active.\n' +
+                        'You will still be counted as working.\n\n' +
+                        'Do you want to sign out anyway?'
+                    );
+                    
+                    if (!confirmed) {
+                        return; // User cancelled, don't sign out
+                    }
                 }
+                
                 SessionManager.clearSession();
                 setCurrentEmployee(null);
                 setCurrentView('selectRole');
                 setError('');
+            };
+            
+            const handleTakeBreak = () => {
+                const now = new Date();
+                const updatedEmployee = {
+                    ...currentEmployee,
+                    onBreak: true,
+                    breakStartTime: now.toISOString(),
+                    isPaused: false
+                };
+                setCurrentEmployee(updatedEmployee);
+                
+                const updatedEmployees = employees.map(emp =>
+                    emp.id === currentEmployee.id ? updatedEmployee : emp
+                );
+                setEmployees(updatedEmployees);
+            };
+            
+            const handlePauseBreak = () => {
+                const now = new Date();
+                const breakStart = new Date(currentEmployee.isPaused ? currentEmployee.breakPausedTime : currentEmployee.breakStartTime);
+                const timeElapsed = (now - breakStart) / (1000 * 60); // in minutes
+                
+                const updatedEmployee = {
+                    ...currentEmployee,
+                    isPaused: true,
+                    breakPausedTime: now.toISOString(),
+                    breakTimeUsed: (currentEmployee.breakTimeUsed || 0) + timeElapsed
+                };
+                setCurrentEmployee(updatedEmployee);
+                
+                const updatedEmployees = employees.map(emp =>
+                    emp.id === currentEmployee.id ? updatedEmployee : emp
+                );
+                setEmployees(updatedEmployees);
+            };
+            
+            const handleResumeBreak = () => {
+                const now = new Date();
+                const updatedEmployee = {
+                    ...currentEmployee,
+                    isPaused: false,
+                    breakStartTime: now.toISOString()
+                };
+                setCurrentEmployee(updatedEmployee);
+                
+                const updatedEmployees = employees.map(emp =>
+                    emp.id === currentEmployee.id ? updatedEmployee : emp
+                );
+                setEmployees(updatedEmployees);
+            };
+            
+            const handleEndBreak = () => {
+                const now = new Date();
+                let totalUsed = currentEmployee.breakTimeUsed || 0;
+                
+                // Add current session time if not paused
+                if (!currentEmployee.isPaused && currentEmployee.breakStartTime) {
+                    const breakStart = new Date(currentEmployee.breakStartTime);
+                    const timeElapsed = (now - breakStart) / (1000 * 60);
+                    totalUsed += timeElapsed;
+                }
+                
+                const updatedEmployee = {
+                    ...currentEmployee,
+                    onBreak: false,
+                    breakStartTime: null,
+                    breakPausedTime: null,
+                    breakTimeUsed: totalUsed,
+                    isPaused: false
+                };
+                setCurrentEmployee(updatedEmployee);
+                
+                const updatedEmployees = employees.map(emp =>
+                    emp.id === currentEmployee.id ? updatedEmployee : emp
+                );
+                setEmployees(updatedEmployees);
             };
 
             const toggleDailyTask = (taskId) => {
@@ -776,6 +874,23 @@
                 );
                 setEmployees(updatedEmployees);
             };
+            
+            const handleNotesChange = (notes) => {
+                setNotesSaveStatus('saving');
+                
+                const updatedEmployee = { ...currentEmployee, notes: notes };
+                setCurrentEmployee(updatedEmployee);
+                
+                const updatedEmployees = employees.map(emp =>
+                    emp.id === currentEmployee.id ? updatedEmployee : emp
+                );
+                setEmployees(updatedEmployees);
+                
+                // Show "saved" status after a short delay
+                setTimeout(() => {
+                    setNotesSaveStatus('saved');
+                }, 500);
+            };
 
             const handleAddEmployee = (e) => {
                 e.preventDefault();
@@ -796,7 +911,14 @@
                             timezone: 'America/Toronto'
                         },
                         dailyTasks: [],
-                        assignedTasks: []
+                        assignedTasks: [],
+                        notes: '',
+                        assignedBreakMinutes: 30, // Default 30 minutes
+                        onBreak: false,
+                        breakStartTime: null,
+                        breakPausedTime: null,
+                        breakTimeUsed: 0,
+                        isPaused: false
                     };
                     setEmployees([...employees, employee]);
                     setNewEmployee({ username: '', password: '', name: '' });
@@ -815,6 +937,81 @@
                 if (window.confirm('Are you sure you want to delete this employee?')) {
                     setEmployees(employees.filter(emp => emp.id !== employeeId));
                     await FirebaseDB.deleteEmployee(employeeId);
+                }
+            };
+            
+            const handleClearWorkHistory = (employeeId) => {
+                if (window.confirm('Are you sure you want to clear ALL work history for this employee? This cannot be undone!')) {
+                    const updatedEmployees = employees.map(emp => {
+                        if (emp.id === employeeId) {
+                            return {
+                                ...emp,
+                                workHistory: []
+                            };
+                        }
+                        return emp;
+                    });
+                    setEmployees(updatedEmployees);
+                }
+            };
+            
+            const handleForceClockOut = (employeeId) => {
+                if (window.confirm('Are you sure you want to clock out and sign out this employee?')) {
+                    const employee = employees.find(emp => emp.id === employeeId);
+                    
+                    if (!employee || !employee.clockedIn) {
+                        alert('Employee is not clocked in!');
+                        return;
+                    }
+                    
+                    const now = new Date();
+                    const clockInDate = new Date(employee.clockInTime);
+                    const totalMinutesWorked = (now - clockInDate) / (1000 * 60);
+                    
+                    // Deduct assigned break time
+                    const assignedBreakMinutes = employee.assignedBreakMinutes || 30;
+                    const netWorkMinutes = totalMinutesWorked - assignedBreakMinutes;
+                    const hoursWorked = (netWorkMinutes / 60).toFixed(2);
+                    
+                    // Create work history entry
+                    const workEntry = {
+                        id: Date.now(),
+                        date: now.toISOString(),
+                        clockIn: employee.clockInTime,
+                        clockOut: now.toISOString(),
+                        hoursWorked: parseFloat(hoursWorked),
+                        assignedBreakMinutes: assignedBreakMinutes,
+                        wasLate: employee.isLateToday || false,
+                        minutesLate: employee.minutesLate || 0,
+                        forcedByOwner: true
+                    };
+                    
+                    // Update employee - clock out
+                    const updatedEmployees = employees.map(emp => {
+                        if (emp.id === employeeId) {
+                            return {
+                                ...emp,
+                                clockedIn: false,
+                                clockOutTime: now.toISOString(),
+                                workHistory: [...(emp.workHistory || []), workEntry],
+                                dailyTasks: emp.dailyTasks.map(task => ({ ...task, completed: false })),
+                                isLateToday: false,
+                                minutesLate: 0,
+                                onBreak: false,
+                                breakStartTime: null,
+                                breakPausedTime: null,
+                                breakTimeUsed: 0,
+                                isPaused: false
+                            };
+                        }
+                        return emp;
+                    });
+                    setEmployees(updatedEmployees);
+                    
+                    // Sign out the employee
+                    SessionManager.clearSession(employee.username);
+                    
+                    alert('Employee has been clocked out and signed out successfully!');
                 }
             };
 
@@ -918,6 +1115,22 @@
                     return emp;
                 });
                 setEmployees(updatedEmployees);
+            };
+            
+            const handleMoveEmployee = (employeeId, direction) => {
+                const currentIndex = employees.findIndex(emp => emp.id === employeeId);
+                
+                if (currentIndex === -1) return;
+                
+                const newIndex = direction === 'up' ? currentIndex - 1 : currentIndex + 1;
+                
+                if (newIndex < 0 || newIndex >= employees.length) return;
+                
+                // Create new array with swapped positions
+                const newEmployees = [...employees];
+                [newEmployees[currentIndex], newEmployees[newIndex]] = [newEmployees[newIndex], newEmployees[currentIndex]];
+                
+                setEmployees(newEmployees);
             };
             
             // Owner task handlers
@@ -1082,17 +1295,27 @@
                 doc.text(`Period: ${startDate} to ${endDate}`, 20, 49);
                 
                 // Calculate totals
-                const totalHours = filteredHistory.reduce((sum, entry) => sum + entry.hoursWorked, 0);
-                doc.text(`Total Hours: ${totalHours.toFixed(2)} hrs`, 20, 56);
+                const totalMinutesPDF = filteredHistory.reduce((sum, entry) => {
+                    const clockIn = new Date(entry.clockIn);
+                    const clockOut = new Date(entry.clockOut);
+                    const totalMinutes = (clockOut - clockIn) / (1000 * 60);
+                    const netMinutes = Math.max(0, totalMinutes - (entry.assignedBreakMinutes || 0));
+                    return sum + netMinutes;
+                }, 0);
+                const totalHoursPDF = Math.floor(totalMinutesPDF / 60);
+                const totalMinsPDF = Math.floor(totalMinutesPDF % 60);
+                doc.text(`Total Net Hours: ${totalHoursPDF}h ${totalMinsPDF}m`, 20, 56);
                 
                 // Add table headers
                 doc.setFontSize(10);
                 let y = 70;
                 doc.setFont(undefined, 'bold');
                 doc.text('Date', 20, y);
-                doc.text('Clock In', 60, y);
-                doc.text('Clock Out', 110, y);
-                doc.text('Hours', 160, y);
+                doc.text('Clock In', 50, y);
+                doc.text('Clock Out', 85, y);
+                doc.text('Total Duration', 120, y);
+                doc.text('Break', 155, y);
+                doc.text('Net Day Hours', 175, y);
                 
                 doc.setFont(undefined, 'normal');
                 y += 7;
@@ -1111,11 +1334,27 @@
                     historyByDate[date].push(entry);
                 });
                 
-                // Add entries
+                // Add entries grouped by date with daily summaries
                 Object.keys(historyByDate).reverse().forEach(date => {
                     const dayEntries = historyByDate[date];
                     
-                    dayEntries.forEach((entry) => {
+                    // Pre-calculate daily net hours for this date
+                    const dayTotalDuration = dayEntries.reduce((sum, entry) => {
+                        const clockIn = new Date(entry.clockIn);
+                        const clockOut = new Date(entry.clockOut);
+                        return sum + ((clockOut - clockIn) / (1000 * 60));
+                    }, 0);
+                    
+                    const assignedBreak = dayEntries[0]?.assignedBreakMinutes || 0;
+                    const dayNetMinutes = Math.max(0, dayTotalDuration - assignedBreak);
+                    
+                    const dayTotalHours = Math.floor(dayTotalDuration / 60);
+                    const dayTotalMins = Math.floor(dayTotalDuration % 60);
+                    const dayNetHours = Math.floor(dayNetMinutes / 60);
+                    const dayNetMins = Math.floor(dayNetMinutes % 60);
+                    
+                    // Add each session for this day
+                    dayEntries.forEach((entry, idx) => {
                         if (y > 270) {
                             doc.addPage();
                             y = 20;
@@ -1132,10 +1371,25 @@
                             hour12: true 
                         });
                         
+                        const clockIn = new Date(entry.clockIn);
+                        const clockOut = new Date(entry.clockOut);
+                        const totalMinutes = (clockOut - clockIn) / (1000 * 60);
+                        const durationHours = Math.floor(totalMinutes / 60);
+                        const durationMins = Math.floor(totalMinutes % 60);
+                        
+                        const isLastSession = idx === dayEntries.length - 1;
+                        
                         doc.text(date, 20, y);
-                        doc.text(clockInTime, 60, y);
-                        doc.text(clockOutTime, 110, y);
-                        doc.text(`${entry.hoursWorked.toFixed(2)} hrs`, 160, y);
+                        doc.text(clockInTime, 50, y);
+                        doc.text(clockOutTime, 85, y);
+                        doc.text(`${durationHours}h ${durationMins}m`, 120, y);
+                        
+                        // Only show Break and Net Day Hours on last session of the day
+                        if (isLastSession) {
+                            doc.text(`-${assignedBreak}m`, 155, y);
+                            doc.text(`${dayNetHours}h ${dayNetMins}m`, 175, y);
+                        }
+                        
                         y += 7;
                     });
                 });
@@ -1453,7 +1707,15 @@
                                     
                                     {employees.map(employee => {
                                         const filteredHistory = filterWorkHistory(employee.workHistory || []);
-                                        const totalHours = filteredHistory.reduce((sum, entry) => sum + entry.hoursWorked, 0);
+                                        const totalMinutes = filteredHistory.reduce((sum, entry) => {
+                                            const clockIn = new Date(entry.clockIn);
+                                            const clockOut = new Date(entry.clockOut);
+                                            const totalMinutes = (clockOut - clockIn) / (1000 * 60);
+                                            const netMinutes = Math.max(0, totalMinutes - (entry.assignedBreakMinutes || 0));
+                                            return sum + netMinutes;
+                                        }, 0);
+                                        const totalHours = Math.floor(totalMinutes / 60);
+                                        const totalMins = Math.floor(totalMinutes % 60);
                                         
                                         // Group work history by date
                                         const historyByDate = {};
@@ -1484,7 +1746,7 @@
                                                                     </span>
                                                                 </div>
                                                                 <span className="text-slate-400 text-sm">
-                                                                    Total Hours: <span className="text-white font-bold">{totalHours.toFixed(2)} hrs</span>
+                                                                    Total Net Hours: <span className="text-white font-bold">{totalHours}h {totalMins}m</span>
                                                                 </span>
                                                             </div>
                                                         </div>
@@ -1506,13 +1768,38 @@
                                                         <div className="space-y-4">
                                                             {Object.keys(historyByDate).reverse().map(date => {
                                                                 const dayEntries = historyByDate[date];
-                                                                const dayTotal = dayEntries.reduce((sum, entry) => sum + entry.hoursWorked, 0);
+                                                                
+                                                                // Calculate total duration for the day (sum of all sessions)
+                                                                const dayTotalDurationMinutes = dayEntries.reduce((sum, entry) => {
+                                                                    const clockIn = new Date(entry.clockIn);
+                                                                    const clockOut = new Date(entry.clockOut);
+                                                                    const totalMinutes = (clockOut - clockIn) / (1000 * 60);
+                                                                    return sum + totalMinutes;
+                                                                }, 0);
+                                                                
+                                                                // Get assigned break (assume same for all entries, take from first)
+                                                                const assignedBreak = dayEntries[0]?.assignedBreakMinutes || 0;
+                                                                
+                                                                // Calculate net hours
+                                                                const dayNetMinutes = Math.max(0, dayTotalDurationMinutes - assignedBreak);
+                                                                
+                                                                // Format durations
+                                                                const totalHours = Math.floor(dayTotalDurationMinutes / 60);
+                                                                const totalMins = Math.floor(dayTotalDurationMinutes % 60);
+                                                                const netHours = Math.floor(dayNetMinutes / 60);
+                                                                const netMins = Math.floor(dayNetMinutes % 60);
                                                                 
                                                                 return (
                                                                     <div key={date} className="border-l-4 border-blue-500 pl-4">
                                                                         <div className="flex justify-between items-center mb-3">
                                                                             <h4 className="text-lg font-semibold text-white">{date}</h4>
-                                                                            <span className="text-blue-400 font-bold">{dayTotal.toFixed(2)} hours</span>
+                                                                            <span className="text-sm text-slate-300">
+                                                                                <span className="text-blue-400">{totalHours}h {totalMins}m</span>
+                                                                                <span className="text-slate-500 mx-2">-</span>
+                                                                                <span className="text-amber-400">{assignedBreak}m</span>
+                                                                                <span className="text-slate-500 mx-2">=</span>
+                                                                                <span className="text-green-400 font-bold">{netHours}h {netMins}m</span>
+                                                                            </span>
                                                                         </div>
                                                                         
                                                                         <div className="space-y-2">
@@ -1572,7 +1859,19 @@
                                                                                                         {new Date(entry.clockOut).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}
                                                                                                     </span>
                                                                                                 </span>
-                                                                                                <span className="text-white font-semibold">{entry.hoursWorked.toFixed(2)} hrs</span>
+                                                                                                {(() => {
+                                                                                                    const clockInDate = new Date(entry.clockIn);
+                                                                                                    const clockOutDate = new Date(entry.clockOut);
+                                                                                                    const totalMinutes = (clockOutDate - clockInDate) / (1000 * 60);
+                                                                                                    const totalHours = Math.floor(totalMinutes / 60);
+                                                                                                    const totalMins = Math.floor(totalMinutes % 60);
+                                                                                                    
+                                                                                                    return (
+                                                                                                        <span className="text-blue-400">
+                                                                                                            Duration: <span className="text-white font-semibold">{totalHours}h {totalMins}m</span>
+                                                                                                        </span>
+                                                                                                    );
+                                                                                                })()}
                                                                                                 {entry.wasLate && (
                                                                                                     <span className="px-2 py-1 bg-amber-500/20 border border-amber-500/50 text-amber-400 rounded text-xs font-medium flex items-center gap-1">
                                                                                                         <AlertCircle size={12} />
@@ -1667,9 +1966,86 @@
                                 </form>
                             </div>
 
-                            <div className="space-y-6">
-                                {employees.map(employee => (
-                                    <div key={employee.id} className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-slate-700/50 overflow-hidden">
+            {/* Sidebar + Detail Layout */}
+            <div className="grid md:grid-cols-4 gap-6">
+                {/* LEFT SIDEBAR - Employee List */}
+                <div className="md:col-span-1">
+                    <h3 className="text-lg font-bold text-white mb-4">Employees</h3>
+                    <div className="space-y-2">
+                        {employees.map((employee, index) => (
+                            <div
+                                key={employee.id}
+                                className={`rounded-lg p-3 transition-all ${
+                                    (selectedEmployee === employee.id || (!selectedEmployee && index === 0))
+                                        ? 'bg-amber-500/20 border-2 border-amber-500'
+                                        : 'bg-slate-800/50 border border-slate-700/50'
+                                }`}
+                            >
+                                <div className="flex items-center gap-2">
+                                    <div className="flex flex-col gap-1">
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                handleMoveEmployee(employee.id, 'up');
+                                            }}
+                                            disabled={index === 0}
+                                            className={`p-1 rounded transition-colors ${
+                                                index === 0
+                                                    ? 'text-slate-600 cursor-not-allowed'
+                                                    : 'text-blue-400 hover:text-blue-300 hover:bg-blue-600/20'
+                                            }`}
+                                            title="Move up"
+                                        >
+                                            <ChevronUp size={16} />
+                                        </button>
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                handleMoveEmployee(employee.id, 'down');
+                                            }}
+                                            disabled={index === employees.length - 1}
+                                            className={`p-1 rounded transition-colors ${
+                                                index === employees.length - 1
+                                                    ? 'text-slate-600 cursor-not-allowed'
+                                                    : 'text-blue-400 hover:text-blue-300 hover:bg-blue-600/20'
+                                            }`}
+                                            title="Move down"
+                                        >
+                                            <ChevronDown size={16} />
+                                        </button>
+                                    </div>
+                                    <div 
+                                        className="flex-1 min-w-0 cursor-pointer"
+                                        onClick={() => setSelectedEmployee(employee.id)}
+                                    >
+                                        <h4 className="text-white font-bold text-sm truncate">{employee.name}</h4>
+                                        <p className="text-slate-400 text-xs truncate">{employee.username}</p>
+                                        {employee.clockedIn && (
+                                            <span className="inline-block mt-1 px-2 py-0.5 bg-green-500/20 text-green-400 rounded-full text-xs">
+                                                {employee.onBreak ? 'On Break' : 'Working'}
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+
+                {/* RIGHT PANEL - Employee Details */}
+                <div className="md:col-span-3">
+                    {(() => {
+                        const employee = employees.find(emp => emp.id === (selectedEmployee || employees[0]?.id));
+                        if (!employee) {
+                            return (
+                                <div className="bg-slate-800/50 rounded-xl p-12 text-center border border-slate-700/50">
+                                    <p className="text-slate-400">No employees yet. Add your first employee above!</p>
+                                </div>
+                            );
+                        }
+
+                        return (
+                            <div key={employee.id} className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-slate-700/50 overflow-hidden">
                                         <div className="bg-gradient-to-r from-slate-700/50 to-slate-800/50 p-6 border-b border-slate-700/50">
                                             <div className="flex justify-between items-start mb-4">
                                                 <div className="flex-1">
@@ -1697,7 +2073,8 @@
                                                                             username: employee.tempUsername || employee.username,
                                                                             password: employee.tempPassword || employee.password,
                                                                             allowedIPs: employee.tempAllowedIPs !== undefined ? employee.tempAllowedIPs : employee.allowedIPs,
-                                                                            schedule: employee.tempSchedule || employee.schedule || { openingTime: '09:00', closingTime: '17:00', timezone: 'America/Toronto' }
+                                                                            schedule: employee.tempSchedule || employee.schedule || { openingTime: '09:00', closingTime: '17:00', timezone: 'America/Toronto' },
+                                                                            assignedBreakMinutes: employee.tempBreakMinutes !== undefined ? employee.tempBreakMinutes : employee.assignedBreakMinutes
                                                                         })}
                                                                         className="px-3 py-1 bg-green-600 hover:bg-green-500 text-white rounded transition-colors"
                                                                     >
@@ -1733,7 +2110,7 @@
                                                                     <label className="text-slate-300 text-xs font-semibold mb-2 block">
                                                                         Work Schedule
                                                                     </label>
-                                                                    <div className="grid grid-cols-3 gap-3">
+                                                                    <div className="grid grid-cols-4 gap-3">
                                                                         <div>
                                                                             <label className="text-slate-400 text-xs mb-1 block">Opening Time</label>
                                                                             <input
@@ -1757,6 +2134,23 @@
                                                                                 }}
                                                                                 className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                             />
+                                                                        </div>
+                                                                        <div>
+                                                                            <label className="text-slate-400 text-xs mb-1 block">Break Time</label>
+                                                                            <select
+                                                                                defaultValue={employee.assignedBreakMinutes || 30}
+                                                                                onChange={(e) => {
+                                                                                    employee.tempBreakMinutes = parseInt(e.target.value);
+                                                                                }}
+                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
+                                                                            >
+                                                                                <option value="15">15 min</option>
+                                                                                <option value="30">30 min</option>
+                                                                                <option value="45">45 min</option>
+                                                                                <option value="60">1 hour</option>
+                                                                                <option value="90">1.5 hours</option>
+                                                                                <option value="120">2 hours</option>
+                                                                            </select>
                                                                         </div>
                                                                         <div>
                                                                             <label className="text-slate-400 text-xs mb-1 block">Timezone</label>
@@ -1837,6 +2231,12 @@
                                                                     </span>
                                                                 </span>
                                                                 <span className="text-slate-400 w-full">
+                                                                    Break Time: 
+                                                                    <span className="text-white font-medium ml-2">
+                                                                        {employee.assignedBreakMinutes || 30} minutes
+                                                                    </span>
+                                                                </span>
+                                                                <span className="text-slate-400 w-full">
                                                                     Allowed IPs: 
                                                                     <span className="text-white font-medium ml-2">
                                                                         {employee.allowedIPs && employee.allowedIPs.length > 0 
@@ -1858,6 +2258,22 @@
                                                             >
                                                                 <Edit2 size={18} />
                                                             </button>
+                                                            <button
+                                                                onClick={() => handleClearWorkHistory(employee.id)}
+                                                                className="p-2 bg-purple-600/20 hover:bg-purple-600/30 text-purple-400 rounded-lg transition-all"
+                                                                title="Clear work history"
+                                                            >
+                                                                <Trash2 size={18} />
+                                                            </button>
+                                                            {employee.clockedIn && (
+                                                                <button
+                                                                    onClick={() => handleForceClockOut(employee.id)}
+                                                                    className="p-2 bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 rounded-lg transition-all"
+                                                                    title="Clock out & sign out employee"
+                                                                >
+                                                                    <LogOut size={18} />
+                                                                </button>
+                                                            )}
                                                             <button
                                                                 onClick={() => handleDeleteEmployee(employee.id)}
                                                                 className="p-2 bg-red-600/20 hover:bg-red-600/30 text-red-400 rounded-lg transition-all"
@@ -2125,11 +2541,29 @@
                                                 </div>
                                             </div>
                                         </div>
+                                        
+                                        {/* Employee Notes Section */}
+                                        {employee.notes && (
+                                            <div className="p-6 bg-slate-900/30 border-t border-slate-700/50">
+                                                <div className="flex items-center gap-2 mb-3">
+                                                    <Edit2 size={18} className="text-blue-400" />
+                                                    <h4 className="text-lg font-bold text-white">Employee Notes</h4>
+                                                </div>
+                                                <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
+                                                    <p className="text-slate-300 whitespace-pre-wrap">{employee.notes}</p>
+                                                </div>
+                                                <p className="text-slate-500 text-xs mt-2">
+                                                    📝 Written by {employee.name}
+                                                </p>
+                                            </div>
+                                        )}
                                     </div>
-                                ))}
-                            </div>
-                            </>
-                            )}
+                        );
+                    })()}
+                </div>
+            </div>
+            </>
+            )}
                             
                             {/* My Tasks View */}
                             {ownerDashboardView === 'myTasks' && (
@@ -2445,8 +2879,26 @@
                                     <div>
                                         <p className="font-semibold">Late Clock-In</p>
                                         <p className="text-sm">
-                                            You clocked in {currentEmployee.minutesLate} minute{currentEmployee.minutesLate !== 1 ? 's' : ''} late. 
-                                            Expected time: {currentEmployee.schedule?.openingTime || '09:00'}
+                                            You clocked in {(() => {
+                                                const totalMinutes = currentEmployee.minutesLate;
+                                                const hours = Math.floor(totalMinutes / 60);
+                                                const minutes = totalMinutes % 60;
+                                                if (hours > 0 && minutes > 0) {
+                                                    return `${hours} hour${hours !== 1 ? 's' : ''} and ${minutes} minute${minutes !== 1 ? 's' : ''}`;
+                                                } else if (hours > 0) {
+                                                    return `${hours} hour${hours !== 1 ? 's' : ''}`;
+                                                } else {
+                                                    return `${minutes} minute${minutes !== 1 ? 's' : ''}`;
+                                                }
+                                            })()} late. 
+                                            Expected time: {(() => {
+                                                const time = currentEmployee.schedule?.openingTime || '09:00';
+                                                const [hours, minutes] = time.split(':');
+                                                const hour = parseInt(hours);
+                                                const ampm = hour >= 12 ? 'PM' : 'AM';
+                                                const displayHour = hour > 12 ? hour - 12 : (hour === 0 ? 12 : hour);
+                                                return `${displayHour}:${minutes} ${ampm}`;
+                                            })()}
                                         </p>
                                     </div>
                                 </div>
@@ -2456,33 +2908,85 @@
                                 <div className="flex items-center justify-between">
                                     <div>
                                         <h2 className="text-3xl font-bold mb-2" style={{ fontFamily: 'Georgia, serif' }}>
-                                            {currentEmployee.clockedIn ? 'Currently Working' : 'Start Your Day'}
+                                            {currentEmployee.clockedIn ? (currentEmployee.onBreak ? 'On Break' : 'Currently Working') : 'Start Your Day'}
                                         </h2>
                                         {currentEmployee.clockedIn ? (
                                             <p className="text-blue-100">
                                                 Clocked in at <span className="font-semibold">{formatTime(currentEmployee.clockInTime)}</span>
+                                                {currentEmployee.onBreak && (
+                                                    <span className="ml-2 text-amber-300">
+                                                        • {currentEmployee.isPaused ? 'Break paused' : `Time left: ${Math.floor(breakTimeRemaining)}:${String(Math.floor((breakTimeRemaining % 1) * 60)).padStart(2, '0')}`}
+                                                    </span>
+                                                )}
                                             </p>
                                         ) : (
                                             <p className="text-blue-100">Click the button to clock in</p>
                                         )}
                                     </div>
-                                    {!currentEmployee.clockedIn ? (
-                                        <button
-                                            onClick={handleClockIn}
-                                            className="flex items-center gap-3 bg-white text-blue-600 px-8 py-4 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
-                                        >
-                                            <Clock size={24} />
-                                            Clock In
-                                        </button>
-                                    ) : (
-                                        <button
-                                            onClick={handleClockOut}
-                                            className="flex items-center gap-3 bg-white text-indigo-600 px-8 py-4 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
-                                        >
-                                            <Clock size={24} />
-                                            Clock Out
-                                        </button>
-                                    )}
+                                    <div className="flex gap-3">
+                                        {!currentEmployee.clockedIn ? (
+                                            <button
+                                                onClick={handleClockIn}
+                                                className="flex items-center gap-3 bg-white text-blue-600 px-8 py-4 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
+                                            >
+                                                <Clock size={24} />
+                                                Clock In
+                                            </button>
+                                        ) : (
+                                            <>
+                                                {currentEmployee.onBreak ? (
+                                                    <>
+                                                        {currentEmployee.isPaused ? (
+                                                            <button
+                                                                onClick={handleResumeBreak}
+                                                                className="flex items-center gap-3 bg-blue-500 text-white px-8 py-4 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
+                                                            >
+                                                                <Clock size={24} />
+                                                                Resume Break
+                                                            </button>
+                                                        ) : (
+                                                            <button
+                                                                onClick={handlePauseBreak}
+                                                                className="flex items-center gap-3 bg-amber-500 text-white px-8 py-4 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
+                                                            >
+                                                                <Clock size={24} />
+                                                                Pause Break
+                                                            </button>
+                                                        )}
+                                                        <button
+                                                            onClick={handleEndBreak}
+                                                            className="flex items-center gap-3 bg-green-500 text-white px-8 py-4 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
+                                                        >
+                                                            <Clock size={24} />
+                                                            End Break
+                                                        </button>
+                                                    </>
+                                                ) : (
+                                                    <button
+                                                        onClick={handleTakeBreak}
+                                                        className="flex items-center gap-3 bg-amber-500 text-white px-6 py-4 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
+                                                    >
+                                                        <Coffee size={24} />
+                                                        {(() => {
+                                                            const assignedMinutes = currentEmployee.assignedBreakMinutes || 30;
+                                                            const usedMinutes = currentEmployee.breakTimeUsed || 0;
+                                                            const remainingMinutes = assignedMinutes - usedMinutes;
+                                                            const mins = Math.floor(remainingMinutes);
+                                                            const secs = Math.floor((remainingMinutes % 1) * 60);
+                                                            return `Take a Break (${mins}:${String(secs).padStart(2, '0')} left)`;
+                                                        })()}
+                                                    </button>
+                                                )}
+                                                <button
+                                                    onClick={handleClockOut}
+                                                    className="flex items-center gap-3 bg-white text-indigo-600 px-8 py-4 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl transition-all hover:scale-105"
+                                                >
+                                                    <Clock size={24} />
+                                                    Clock Out
+                                                </button>
+                                            </>
+                                        )}
+                                    </div>
                                 </div>
                             </div>
 
@@ -2612,6 +3116,43 @@
                                             </div>
                                         </div>
                                     </div>
+                                    
+                                    {/* Notes Section */}
+                                    <div className="mt-6 bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl p-6 border border-slate-700/50">
+                                        <div className="flex items-center justify-between mb-4">
+                                            <div className="flex items-center gap-2">
+                                                <Edit2 size={20} className="text-blue-400" />
+                                                <h3 className="text-2xl font-bold text-white">My Notes</h3>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                {notesSaveStatus === 'saving' ? (
+                                                    <span className="text-amber-400 text-sm flex items-center gap-1">
+                                                        <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                                        </svg>
+                                                        Saving...
+                                                    </span>
+                                                ) : (
+                                                    <span className="text-green-400 text-sm flex items-center gap-1">
+                                                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path>
+                                                        </svg>
+                                                        Saved
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </div>
+                                        <textarea
+                                            value={currentEmployee.notes || ''}
+                                            onChange={(e) => handleNotesChange(e.target.value)}
+                                            placeholder="Write Notes...remember important things or updates here."
+                                            className="w-full h-40 px-4 py-3 bg-slate-900/50 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-none"
+                                        />
+                                        <p className="text-slate-500 text-xs mt-2">
+                                            💡 Use this space to remember tasks, important things so you don't miss anything
+                                        </p>
+                                    </div>
                                 </div>
                                 
                                 {!currentEmployee.clockedIn && (
@@ -2628,10 +3169,10 @@
                     </div>
                 );
             }
-
+            
             return null;
         };
-
+        
         // Render the app
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<App />);
