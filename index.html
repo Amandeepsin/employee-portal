@@ -1304,7 +1304,9 @@
                 }, 0);
                 const totalHoursPDF = Math.floor(totalMinutesPDF / 60);
                 const totalMinsPDF = Math.floor(totalMinutesPDF % 60);
+                doc.setFont(undefined, 'bold');
                 doc.text(`Total Net Hours: ${totalHoursPDF}h ${totalMinsPDF}m`, 20, 56);
+                doc.setFont(undefined, 'normal');
                 
                 // Add table headers
                 doc.setFontSize(10);
@@ -1393,6 +1395,17 @@
                         y += 7;
                     });
                 });
+                
+                // Add total line at the bottom
+                if (y > 260) {
+                    doc.addPage();
+                    y = 20;
+                }
+                y += 3; // Extra spacing before total line
+                doc.setFont(undefined, 'bold');
+                doc.text('TOTAL:', 120, y);
+                doc.text(`${totalHoursPDF}h ${totalMinsPDF}m`, 175, y);
+                doc.setFont(undefined, 'normal');
                 
                 // Save the PDF
                 const fileName = `${employee.name.replace(/\s+/g, '_')}_work_history_${new Date().toISOString().split('T')[0]}.pdf`;
