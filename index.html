@@ -558,6 +558,76 @@
                     return () => clearInterval(interval);
                 }
             }, [currentView, currentEmployee]);
+            
+            // Midnight reset for employee daily tasks
+            useEffect(() => {
+                if (currentView === 'employeeDashboard' && currentEmployee) {
+                    const checkMidnight = () => {
+                        const timezone = currentEmployee.schedule?.timezone || 'America/Toronto';
+                        const now = new Date();
+                        const employeeTime = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
+                        
+                        // Check if it's midnight (00:00:00)
+                        const hours = employeeTime.getHours();
+                        const minutes = employeeTime.getMinutes();
+                        const seconds = employeeTime.getSeconds();
+                        
+                        if (hours === 0 && minutes === 0 && seconds === 0) {
+                            // Reset daily tasks at midnight
+                            const updatedEmployee = {
+                                ...currentEmployee,
+                                dailyTasks: currentEmployee.dailyTasks.map(task => ({
+                                    ...task,
+                                    completed: false
+                                }))
+                            };
+                            
+                            // Update in employees array
+                            const updatedEmployees = employees.map(emp =>
+                                emp.id === currentEmployee.id ? updatedEmployee : emp
+                            );
+                            setEmployees(updatedEmployees);
+                            setCurrentEmployee(updatedEmployee);
+                        }
+                    };
+                    
+                    // Check every second
+                    const interval = setInterval(checkMidnight, 1000);
+                    return () => clearInterval(interval);
+                }
+            }, [currentView, currentEmployee, employees]);
+            
+            // Midnight reset for owner daily tasks (EST timezone)
+            useEffect(() => {
+                if (currentView === 'ownerDashboard' && owner) {
+                    const checkMidnight = () => {
+                        const now = new Date();
+                        const estTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+                        
+                        // Check if it's midnight EST (00:00:00)
+                        const hours = estTime.getHours();
+                        const minutes = estTime.getMinutes();
+                        const seconds = estTime.getSeconds();
+                        
+                        if (hours === 0 && minutes === 0 && seconds === 0) {
+                            // Reset owner daily tasks at midnight EST
+                            const updatedOwner = {
+                                ...owner,
+                                dailyTasks: owner.dailyTasks.map(task => ({
+                                    ...task,
+                                    completed: false
+                                }))
+                            };
+                            setOwner(updatedOwner);
+                        }
+                    };
+                    
+                    // Check every second
+                    const interval = setInterval(checkMidnight, 1000);
+                    return () => clearInterval(interval);
+                }
+            }, [currentView, owner]);
+
 
             // Prevent closing browser/tab without clocking out - Auto clock out on close
             useEffect(() => {
