@@ -349,6 +349,40 @@
 
         // Firebase helper functions
         const FirebaseDB = {
+            loadOwner: async (setOwner) => {
+                if (!useFirebase) {
+                    setOwner(Storage.getOwner());
+                    return;
+                }
+                
+                try {
+                    const doc = await db.collection('owner').doc('ownerData').get();
+                    if (doc.exists) {
+                        setOwner(doc.data());
+                    } else {
+                        // Initialize with default owner
+                        const defaultOwner = Storage.getOwner();
+                        await db.collection('owner').doc('ownerData').set(defaultOwner);
+                        setOwner(defaultOwner);
+                    }
+                } catch (error) {
+                    console.error("Error loading owner:", error);
+                    setOwner(Storage.getOwner());
+                }
+            },
+            
+            saveOwner: async (owner) => {
+                if (!useFirebase) {
+                    return;
+                }
+                
+                try {
+                    await db.collection('owner').doc('ownerData').set(owner);
+                } catch (error) {
+                    console.error("Error saving owner:", error);
+                }
+            },
+            
             loadEmployees: async (setEmployees) => {
                 if (!useFirebase) {
                     setEmployees(Storage.getEmployees());
@@ -469,9 +503,10 @@
                 }
             }, [employees]);
 
-            // Load employees on mount
+            // Load data on mount
             useEffect(() => {
                 const loadData = async () => {
+                    await FirebaseDB.loadOwner(setOwner);
                     await FirebaseDB.loadEmployees(setEmployees);
                     setLoading(false);
                 };
@@ -493,10 +528,14 @@
             
             // Save owner data whenever it changes
             useEffect(() => {
-                if (owner) {
+                if (!loading && owner) {
                     Storage.saveOwner(owner);
+                    
+                    if (useFirebase) {
+                        FirebaseDB.saveOwner(owner);
+                    }
                 }
-            }, [owner]);
+            }, [owner, loading]);
             
             // Break timer - auto end when time runs out
             useEffect(() => {
