@@ -493,10 +493,10 @@
             
             // Save owner data whenever it changes
             useEffect(() => {
-                if (!loading && owner) {
+                if (owner) {
                     Storage.saveOwner(owner);
                 }
-            }, [owner, loading]);
+            }, [owner]);
             
             // Break timer - auto end when time runs out
             useEffect(() => {
