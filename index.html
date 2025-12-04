@@ -646,96 +646,6 @@
             }, [currentView, owner]);
 
 
-            // Prevent closing browser/tab without clocking out - Auto clock out on close
-            useEffect(() => {
-                if (currentView === 'employeeDashboard' && currentEmployee?.clockedIn) {
-                    const handleBeforeUnload = (e) => {
-                        // Show warning
-                        e.preventDefault();
-                        e.returnValue = 'You are still clocked in! If you close this tab, you will be automatically clocked out.';
-                        
-                        // Auto clock-out when the page unloads
-                        const handleUnload = () => {
-                            const now = new Date();
-                            const clockInDate = new Date(currentEmployee.clockInTime);
-                            const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
-                            
-                            // Create work history entry
-                            const workEntry = {
-                                id: Date.now(),
-                                date: now.toISOString(),
-                                clockIn: currentEmployee.clockInTime,
-                                clockOut: now.toISOString(),
-                                hoursWorked: parseFloat(hoursWorked),
-                                autoClockOut: true // Flag for auto clock-out
-                            };
-                            
-                            // Update employee data
-                            const updatedEmployee = {
-                                ...currentEmployee,
-                                clockedIn: false,
-                                clockOutTime: now.toISOString(),
-                                workHistory: [...(currentEmployee.workHistory || []), workEntry],
-                                dailyTasks: currentEmployee.dailyTasks.map(task => ({ ...task, completed: false })),
-                                assignedTasks: currentEmployee.assignedTasks.filter(task => !task.completed)
-                            };
-                            
-                            // Get all employees and update
-                            const allEmployees = Storage.getEmployees();
-                            const updatedEmployees = allEmployees.map(emp =>
-                                emp.id === currentEmployee.id ? updatedEmployee : emp
-                            );
-                            Storage.saveEmployees(updatedEmployees);
-                            
-                            // Clear session
-                            SessionManager.clearSession();
-                        };
-                        
-                        return e.returnValue;
-                    };
-                    
-                    const handleUnload = () => {
-                        if (currentEmployee?.clockedIn) {
-                            const now = new Date();
-                            const clockInDate = new Date(currentEmployee.clockInTime);
-                            const hoursWorked = ((now - clockInDate) / (1000 * 60 * 60)).toFixed(2);
-                            
-                            const workEntry = {
-                                id: Date.now(),
-                                date: now.toISOString(),
-                                clockIn: currentEmployee.clockInTime,
-                                clockOut: now.toISOString(),
-                                hoursWorked: parseFloat(hoursWorked),
-                                autoClockOut: true
-                            };
-                            
-                            const updatedEmployee = {
-                                ...currentEmployee,
-                                clockedIn: false,
-                                clockOutTime: now.toISOString(),
-                                workHistory: [...(currentEmployee.workHistory || []), workEntry],
-                                dailyTasks: currentEmployee.dailyTasks.map(task => ({ ...task, completed: false })),
-                                assignedTasks: currentEmployee.assignedTasks.filter(task => !task.completed)
-                            };
-                            
-                            const allEmployees = Storage.getEmployees();
-                            const updatedEmployees = allEmployees.map(emp =>
-                                emp.id === currentEmployee.id ? updatedEmployee : emp
-                            );
-                            Storage.saveEmployees(updatedEmployees);
-                            SessionManager.clearSession();
-                        }
-                    };
-                    
-                    window.addEventListener('beforeunload', handleBeforeUnload);
-                    window.addEventListener('unload', handleUnload);
-                    return () => {
-                        window.removeEventListener('beforeunload', handleBeforeUnload);
-                        window.removeEventListener('unload', handleUnload);
-                    };
-                }
-            }, [currentView, currentEmployee]);
-
             const handleOwnerLogin = (e) => {
                 e.preventDefault();
                 const owner = Storage.getOwner();
@@ -995,6 +905,13 @@
             };
 
             const handleClockIn = () => {
+                // Check if already clocked in
+                if (currentEmployee.clockedIn) {
+                    setError('You are already clocked in!');
+                    setTimeout(() => setError(''), 3000);
+                    return;
+                }
+                
                 const now = new Date();
                 
                 // Check if employee is late
@@ -1029,8 +946,7 @@
                     clockedIn: true, 
                     clockInTime: now.toISOString(),
                     isLateToday: isLate,
-                    minutesLate: minutesLate,
-                    hasBeenAutoClocked: false
+                    minutesLate: minutesLate
                 });
             };
 
@@ -2518,11 +2434,6 @@
                                                                                                     <span className="px-2 py-1 bg-amber-500/20 border border-amber-500/50 text-amber-400 rounded text-xs font-medium flex items-center gap-1">
                                                                                                         <AlertCircle size={12} />
                                                                                                         Late by {entry.minutesLate} min
-                                                                                                    </span>
-                                                                                                )}
-                                                                                                {entry.autoClockOut && (
-                                                                                                    <span className="px-2 py-1 bg-blue-500/20 border border-blue-500/50 text-blue-400 rounded text-xs font-medium">
-                                                                                                        Auto Clock-Out
                                                                                                     </span>
                                                                                                 )}
                                                                                             </div>
