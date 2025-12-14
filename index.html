@@ -454,6 +454,7 @@
             const [loginForm, setLoginForm] = useState({ username: '', password: '' });
             const [error, setError] = useState('');
             const [editingEmployee, setEditingEmployee] = useState(null);
+            const [editFormData, setEditFormData] = useState({});
             const [showPassword, setShowPassword] = useState({});
             const [newEmployee, setNewEmployee] = useState({ username: '', password: '', name: '', phone: '', email: '', idDocument: null });
             const [editingDailyTasks, setEditingDailyTasks] = useState(null);
@@ -1217,7 +1218,20 @@
                     emp.id === employeeId ? { ...emp, ...updates } : emp
                 );
                 setEmployees(updatedEmployees);
+                
+                // Save to localStorage immediately
+                Storage.saveEmployees(updatedEmployees);
+                
+                // Save to Firebase immediately if enabled
+                if (useFirebase) {
+                    const updatedEmployee = updatedEmployees.find(emp => emp.id === employeeId);
+                    if (updatedEmployee) {
+                        FirebaseDB.saveEmployee(updatedEmployee);
+                    }
+                }
+                
                 setEditingEmployee(null);
+                setEditFormData({}); // Clear form data
             };
 
             const handleDeleteEmployee = async (employeeId) => {
@@ -2609,34 +2623,41 @@
                                                                 <div className="flex gap-2">
                                                                     <input
                                                                         type="text"
-                                                                        defaultValue={employee.username}
-                                                                        onChange={(e) => employee.tempUsername = e.target.value}
+                                                                        value={editFormData.username || ''}
+                                                                        onChange={(e) => setEditFormData({...editFormData, username: e.target.value})}
                                                                         className="px-3 py-1 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                         placeholder="Username"
                                                                     />
                                                                     <input
                                                                         type="text"
-                                                                        defaultValue={employee.password}
-                                                                        onChange={(e) => employee.tempPassword = e.target.value}
+                                                                        value={editFormData.password || ''}
+                                                                        onChange={(e) => setEditFormData({...editFormData, password: e.target.value})}
                                                                         className="px-3 py-1 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                         placeholder="Password"
                                                                     />
                                                                     <button
                                                                         onClick={() => handleUpdateEmployee(employee.id, {
-                                                                            username: employee.tempUsername || employee.username,
-                                                                            password: employee.tempPassword || employee.password,
-                                                                            phone: employee.tempPhone !== undefined ? employee.tempPhone : employee.phone,
-                                                                            email: employee.tempEmail !== undefined ? employee.tempEmail : employee.email,
-                                                                            allowedIPs: employee.tempAllowedIPs !== undefined ? employee.tempAllowedIPs : employee.allowedIPs,
-                                                                            schedule: employee.tempSchedule || employee.schedule || { openingTime: '09:00', closingTime: '17:00', timezone: 'America/Toronto' },
-                                                                            assignedBreakMinutes: employee.tempBreakMinutes !== undefined ? employee.tempBreakMinutes : employee.assignedBreakMinutes
+                                                                            username: editFormData.username,
+                                                                            password: editFormData.password,
+                                                                            phone: editFormData.phone,
+                                                                            email: editFormData.email,
+                                                                            allowedIPs: editFormData.allowedIPs,
+                                                                            schedule: {
+                                                                                openingTime: editFormData.openingTime,
+                                                                                closingTime: editFormData.closingTime,
+                                                                                timezone: editFormData.timezone
+                                                                            },
+                                                                            assignedBreakMinutes: parseInt(editFormData.assignedBreakMinutes) || 30
                                                                         })}
                                                                         className="px-3 py-1 bg-green-600 hover:bg-green-500 text-white rounded transition-colors"
                                                                     >
                                                                         <Save size={16} />
                                                                     </button>
                                                                     <button
-                                                                        onClick={() => setEditingEmployee(null)}
+                                                                        onClick={() => {
+                                                                            setEditingEmployee(null);
+                                                                            setEditFormData({});
+                                                                        }}
                                                                         className="px-3 py-1 bg-slate-600 hover:bg-slate-500 text-white rounded transition-colors"
                                                                     >
                                                                         <X size={16} />
@@ -2652,8 +2673,8 @@
                                                                             <label className="text-slate-400 text-xs mb-1 block">Phone Number</label>
                                                                             <input
                                                                                 type="tel"
-                                                                                defaultValue={employee.phone || ''}
-                                                                                onChange={(e) => employee.tempPhone = e.target.value}
+                                                                                value={editFormData.phone || ''}
+                                                                                onChange={(e) => setEditFormData({...editFormData, phone: e.target.value})}
                                                                                 className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                                 placeholder="Phone number"
                                                                             />
@@ -2662,8 +2683,8 @@
                                                                             <label className="text-slate-400 text-xs mb-1 block">Email Address</label>
                                                                             <input
                                                                                 type="email"
-                                                                                defaultValue={employee.email || ''}
-                                                                                onChange={(e) => employee.tempEmail = e.target.value}
+                                                                                value={editFormData.email || ''}
+                                                                                onChange={(e) => setEditFormData({...editFormData, email: e.target.value})}
                                                                                 className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                                 placeholder="Email address"
                                                                             />
@@ -2692,10 +2713,10 @@
                                                                     </label>
                                                                     <input
                                                                         type="text"
-                                                                        defaultValue={employee.allowedIPs?.join(', ') || ''}
+                                                                        value={Array.isArray(editFormData.allowedIPs) ? editFormData.allowedIPs.join(', ') : (editFormData.allowedIPs || '')}
                                                                         onChange={(e) => {
                                                                             const ips = e.target.value.split(',').map(ip => ip.trim()).filter(ip => ip);
-                                                                            employee.tempAllowedIPs = ips;
+                                                                            setEditFormData({...editFormData, allowedIPs: ips});
                                                                         }}
                                                                         className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                         placeholder="e.g., 203.0.113.45, 198.51.100.123"
@@ -2714,11 +2735,8 @@
                                                                             <label className="text-slate-400 text-xs mb-1 block">Opening Time</label>
                                                                             <input
                                                                                 type="time"
-                                                                                defaultValue={employee.schedule?.openingTime || '09:00'}
-                                                                                onChange={(e) => {
-                                                                                    if (!employee.tempSchedule) employee.tempSchedule = { ...employee.schedule };
-                                                                                    employee.tempSchedule.openingTime = e.target.value;
-                                                                                }}
+                                                                                value={editFormData.openingTime || '09:00'}
+                                                                                onChange={(e) => setEditFormData({...editFormData, openingTime: e.target.value})}
                                                                                 className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                             />
                                                                         </div>
@@ -2726,21 +2744,16 @@
                                                                             <label className="text-slate-400 text-xs mb-1 block">Closing Time</label>
                                                                             <input
                                                                                 type="time"
-                                                                                defaultValue={employee.schedule?.closingTime || '17:00'}
-                                                                                onChange={(e) => {
-                                                                                    if (!employee.tempSchedule) employee.tempSchedule = { ...employee.schedule };
-                                                                                    employee.tempSchedule.closingTime = e.target.value;
-                                                                                }}
+                                                                                value={editFormData.closingTime || '17:00'}
+                                                                                onChange={(e) => setEditFormData({...editFormData, closingTime: e.target.value})}
                                                                                 className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                             />
                                                                         </div>
                                                                         <div>
                                                                             <label className="text-slate-400 text-xs mb-1 block">Break Time</label>
                                                                             <select
-                                                                                defaultValue={employee.assignedBreakMinutes || 30}
-                                                                                onChange={(e) => {
-                                                                                    employee.tempBreakMinutes = parseInt(e.target.value);
-                                                                                }}
+                                                                                value={editFormData.assignedBreakMinutes || 30}
+                                                                                onChange={(e) => setEditFormData({...editFormData, assignedBreakMinutes: parseInt(e.target.value)})}
                                                                                 className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                             >
                                                                                 <option value="15">15 min</option>
@@ -2754,11 +2767,8 @@
                                                                         <div>
                                                                             <label className="text-slate-400 text-xs mb-1 block">Timezone</label>
                                                                             <select
-                                                                                defaultValue={employee.schedule?.timezone || 'America/Toronto'}
-                                                                                onChange={(e) => {
-                                                                                    if (!employee.tempSchedule) employee.tempSchedule = { ...employee.schedule };
-                                                                                    employee.tempSchedule.timezone = e.target.value;
-                                                                                }}
+                                                                                value={editFormData.timezone || 'America/Toronto'}
+                                                                                onChange={(e) => setEditFormData({...editFormData, timezone: e.target.value})}
                                                                                 className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
                                                                             >
                                                                                 <optgroup label="🇨🇦 Canada">
@@ -2878,7 +2888,20 @@
                                                     {editingEmployee !== employee.id && (
                                                         <>
                                                             <button
-                                                                onClick={() => setEditingEmployee(employee.id)}
+                                                                onClick={() => {
+                                                                    setEditingEmployee(employee.id);
+                                                                    setEditFormData({
+                                                                        username: employee.username,
+                                                                        password: employee.password,
+                                                                        phone: employee.phone || '',
+                                                                        email: employee.email || '',
+                                                                        allowedIPs: employee.allowedIPs || '',
+                                                                        openingTime: employee.schedule?.openingTime || '09:00',
+                                                                        closingTime: employee.schedule?.closingTime || '17:00',
+                                                                        timezone: employee.schedule?.timezone || 'America/Toronto',
+                                                                        assignedBreakMinutes: employee.assignedBreakMinutes || 30
+                                                                    });
+                                                                }}
                                                                 className="p-2 bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 rounded-lg transition-all"
                                                                 title="Edit credentials"
                                                             >
