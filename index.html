@@ -460,6 +460,24 @@
                 }
             },
             
+            saveEmployees: async (employees) => {
+                if (!useFirebase) {
+                    return;
+                }
+                
+                try {
+                    // Save all employees to Firebase
+                    const batch = db.batch();
+                    employees.forEach(emp => {
+                        const docRef = db.collection('employees').doc(emp.id.toString());
+                        batch.set(docRef, emp);
+                    });
+                    await batch.commit();
+                } catch (error) {
+                    console.error("Error saving employees:", error);
+                }
+            },
+            
             deleteEmployee: async (employeeId) => {
                 if (!useFirebase) {
                     return;
@@ -603,6 +621,14 @@
             const [showBusinessModal, setShowBusinessModal] = useState(false);
             const [businessForm, setBusinessForm] = useState({ name: '', location: '' });
             const [editingBusinessId, setEditingBusinessId] = useState(null);
+            const [businessFilter, setBusinessFilter] = useState('single'); // 'single' or 'all'
+            const [tasksSubView, setTasksSubView] = useState('business'); // 'business' or 'fromEmployees'
+            const [expandedEmployees, setExpandedEmployees] = useState({}); // Track which employee boxes are expanded
+            
+            // State for assigning tasks to employees
+            const [showAssignTaskModal, setShowAssignTaskModal] = useState(false);
+            const [taskToAssign, setTaskToAssign] = useState(null); // {task, businessId, taskType}
+            const [selectedEmployeeToAssign, setSelectedEmployeeToAssign] = useState('');
             
             // State for forgot password
             const [showForgotPassword, setShowForgotPassword] = useState(false);
@@ -826,6 +852,16 @@
                     return () => clearInterval(interval);
                 }
             }, [currentView, owner]);
+
+            // Debug: Log when assign modal opens
+            useEffect(() => {
+                if (showAssignTaskModal) {
+                    console.log('=== Assign Modal Opened ===');
+                    console.log('taskToAssign:', taskToAssign);
+                    console.log('selectedEmployeeToAssign:', selectedEmployeeToAssign);
+                    console.log('employees:', employees);
+                }
+            }, [showAssignTaskModal]);
 
 
             const handleOwnerLogin = (e) => {
@@ -1321,6 +1357,7 @@
             };
 
             const toggleDailyTask = (taskId) => {
+                const task = currentEmployee.dailyTasks.find(t => t.id === taskId);
                 const updatedTasks = currentEmployee.dailyTasks.map(task =>
                     task.id === taskId ? { ...task, completed: !task.completed } : task
                 );
@@ -1331,9 +1368,33 @@
                     emp.id === currentEmployee.id ? updatedEmployee : emp
                 );
                 setEmployees(updatedEmployees);
+                
+                // Sync completion state back to owner's tasks if this task was assigned from owner
+                if (owner && owner.businesses) {
+                    const updatedOwner = {
+                        ...owner,
+                        businesses: owner.businesses.map(business => ({
+                            ...business,
+                            dailyTasks: business.dailyTasks.map(ownerTask => {
+                                // If this owner task is assigned to current employee and has same text
+                                if (ownerTask.assignedTo?.employeeId === currentEmployee.id && 
+                                    ownerTask.task === task.task) {
+                                    return { ...ownerTask, completed: !task.completed };
+                                }
+                                return ownerTask;
+                            })
+                        }))
+                    };
+                    setOwner(updatedOwner);
+                    Storage.saveOwner(updatedOwner);
+                    if (useFirebase) {
+                        FirebaseDB.saveOwner(updatedOwner);
+                    }
+                }
             };
 
             const toggleAssignedTask = (taskId) => {
+                const task = currentEmployee.assignedTasks.find(t => t.id === taskId);
                 const updatedTasks = currentEmployee.assignedTasks.map(task =>
                     task.id === taskId ? { ...task, completed: !task.completed } : task
                 );
@@ -1344,6 +1405,29 @@
                     emp.id === currentEmployee.id ? updatedEmployee : emp
                 );
                 setEmployees(updatedEmployees);
+                
+                // Sync completion state back to owner's tasks if this task was assigned from owner
+                if (owner && owner.businesses) {
+                    const updatedOwner = {
+                        ...owner,
+                        businesses: owner.businesses.map(business => ({
+                            ...business,
+                            assignedTasks: business.assignedTasks.map(ownerTask => {
+                                // If this owner task is assigned to current employee and has same text
+                                if (ownerTask.assignedTo?.employeeId === currentEmployee.id && 
+                                    ownerTask.task === task.task) {
+                                    return { ...ownerTask, completed: !task.completed };
+                                }
+                                return ownerTask;
+                            })
+                        }))
+                    };
+                    setOwner(updatedOwner);
+                    Storage.saveOwner(updatedOwner);
+                    if (useFirebase) {
+                        FirebaseDB.saveOwner(updatedOwner);
+                    }
+                }
             };
             
             // NEW: Handler for employee to assign task to owner
@@ -1886,6 +1970,122 @@
                 }
             };
             
+            // Function to assign owner's task to an employee
+            const handleAssignTaskToEmployee = async () => {
+                console.log('Assigning task...', {
+                    selectedEmployeeToAssign,
+                    taskToAssign
+                });
+                
+                if (!selectedEmployeeToAssign || !taskToAssign) {
+                    console.log('Missing required fields');
+                    return;
+                }
+                
+                // Try both strict and loose equality
+                let employee = employees.find(emp => emp.id == selectedEmployeeToAssign);
+                
+                console.log('Looking for employee with ID:', selectedEmployeeToAssign);
+                console.log('Available employees:', employees.map(e => ({ id: e.id, name: e.name, type: typeof e.id })));
+                console.log('Found employee:', employee);
+                
+                if (!employee) {
+                    console.log('Employee not found!');
+                    alert('Error: Could not find employee. Please try again.');
+                    return;
+                }
+                
+                console.log('Found employee:', employee);
+                
+                // Get the task type from taskToAssign (dailyTasks or assignedTasks)
+                const targetTaskType = taskToAssign.taskType;
+                
+                // Check if employee already has this exact task
+                const existingTasks = employee[targetTaskType] || [];
+                const taskAlreadyExists = existingTasks.some(t => t.task === taskToAssign.task.task);
+                
+                if (taskAlreadyExists) {
+                    alert(`${employee.name} already has this task assigned!`);
+                    setShowAssignTaskModal(false);
+                    setTaskToAssign(null);
+                    setSelectedEmployeeToAssign('');
+                    return;
+                }
+                
+                // Add task to employee's task list
+                const newTask = {
+                    id: Date.now(),
+                    task: taskToAssign.task.task,
+                    completed: false
+                };
+                
+                console.log('New task to add:', newTask, 'to', targetTaskType);
+                
+                const updatedEmployees = employees.map(emp => {
+                    if (emp.id == selectedEmployeeToAssign) {
+                        const currentTasks = emp[targetTaskType] || [];
+                        return {
+                            ...emp,
+                            [targetTaskType]: [...currentTasks, newTask]
+                        };
+                    }
+                    return emp;
+                });
+                
+                console.log('Updated employees:', updatedEmployees);
+                
+                setEmployees(updatedEmployees);
+                Storage.saveEmployees(updatedEmployees);
+                
+                if (useFirebase) {
+                    try {
+                        await FirebaseDB.saveEmployees(updatedEmployees);
+                        console.log('Successfully saved to Firebase');
+                    } catch (error) {
+                        console.error('Firebase save error:', error);
+                        // Continue anyway - localStorage is saved
+                    }
+                }
+                
+                const taskTypeName = targetTaskType === 'dailyTasks' ? 'Daily Task' : 'Assigned Task';
+                console.log('Task assigned successfully!');
+                
+                // Mark the owner's task as assigned
+                const updatedOwner = {
+                    ...owner,
+                    businesses: owner.businesses.map(b => {
+                        if (b.id === taskToAssign.businessId) {
+                            return {
+                                ...b,
+                                [taskToAssign.taskType]: b[taskToAssign.taskType].map(t => 
+                                    t.id === taskToAssign.task.id 
+                                        ? { ...t, assignedTo: { employeeId: employee.id, employeeName: employee.name } }
+                                        : t
+                                )
+                            };
+                        }
+                        return b;
+                    })
+                };
+                
+                setOwner(updatedOwner);
+                Storage.saveOwner(updatedOwner);
+                if (useFirebase) {
+                    try {
+                        await FirebaseDB.saveOwner(updatedOwner);
+                    } catch (error) {
+                        console.error('Firebase save owner error:', error);
+                    }
+                }
+                
+                alert(`Task assigned successfully to ${employee.name} as a ${taskTypeName}!`);
+                
+                // Close modal and reset
+                setShowAssignTaskModal(false);
+                setTaskToAssign(null);
+                setSelectedEmployeeToAssign('');
+            };
+            
             const handleAddOwnerTask = (taskType, taskText, businessId) => {
                 if (!businessId) businessId = selectedBusinessId;
                 if (!taskText.trim() || !businessId) return;
@@ -1937,6 +2137,10 @@
                 if (!businessId) businessId = selectedBusinessId;
                 if (!newText.trim()) return;
                 
+                // Get the old task to find which employee it's assigned to
+                const business = owner.businesses.find(b => b.id === businessId);
+                const oldTask = business?.[taskType]?.find(t => t.id === taskId);
+                
                 const updatedOwner = {
                     ...owner,
                     businesses: owner.businesses.map(b => 
@@ -1955,6 +2159,29 @@
                 Storage.saveOwner(updatedOwner);
                 if (useFirebase) {
                     FirebaseDB.saveOwner(updatedOwner);
+                }
+                
+                // If task is assigned to an employee, update it on their side too
+                if (oldTask?.assignedTo) {
+                    const updatedEmployees = employees.map(emp => {
+                        if (emp.id === oldTask.assignedTo.employeeId) {
+                            return {
+                                ...emp,
+                                [taskType]: emp[taskType].map(empTask => 
+                                    empTask.task === oldTask.task 
+                                        ? { ...empTask, task: newText }
+                                        : empTask
+                                )
+                            };
+                        }
+                        return emp;
+                    });
+                    
+                    setEmployees(updatedEmployees);
+                    Storage.saveEmployees(updatedEmployees);
+                    if (useFirebase) {
+                        FirebaseDB.saveEmployees(updatedEmployees);
+                    }
                 }
                 
                 setEditingTaskId(null);
@@ -2904,25 +3131,49 @@
                                         
                                         return (
                                             <div key={employee.id} className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-slate-700/50 overflow-hidden">
-                                                {/* Employee Header */}
-                                                <div className="bg-gradient-to-r from-slate-700/50 to-slate-800/50 p-6 border-b border-slate-700/50">
+                                                {/* Employee Header - Clickable */}
+                                                <div 
+                                                    className="bg-gradient-to-r from-slate-700/50 to-slate-800/50 p-6 border-b border-slate-700/50 cursor-pointer hover:from-slate-700/70 hover:to-slate-800/70 transition-all"
+                                                    onClick={() => setExpandedEmployees(prev => ({
+                                                        ...prev,
+                                                        [employee.id]: !prev[employee.id]
+                                                    }))}
+                                                >
                                                     <div className="flex justify-between items-center">
-                                                        <div>
-                                                            <h3 className="text-2xl font-bold text-white mb-2">{employee.name}</h3>
-                                                            <div className="flex items-center gap-4">
-                                                                <div className="flex items-center gap-2">
-                                                                    <div className={`w-3 h-3 rounded-full ${employee.clockedIn ? 'bg-green-500' : 'bg-slate-500'}`}></div>
-                                                                    <span className="text-slate-300 text-sm">
-                                                                        {employee.clockedIn ? 'Currently Working' : 'Not Working'}
+                                                        <div className="flex items-center gap-4">
+                                                            {/* Expand/Collapse Icon */}
+                                                            <div className="text-slate-400">
+                                                                {expandedEmployees[employee.id] ? (
+                                                                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path>
+                                                                    </svg>
+                                                                ) : (
+                                                                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7"></path>
+                                                                    </svg>
+                                                                )}
+                                                            </div>
+                                                            
+                                                            <div>
+                                                                <h3 className="text-2xl font-bold text-white mb-2">{employee.name}</h3>
+                                                                <div className="flex items-center gap-4">
+                                                                    <div className="flex items-center gap-2">
+                                                                        <div className={`w-3 h-3 rounded-full ${employee.clockedIn ? 'bg-green-500' : 'bg-slate-500'}`}></div>
+                                                                        <span className="text-slate-300 text-sm">
+                                                                            {employee.clockedIn ? 'Currently Working' : 'Not Working'}
+                                                                        </span>
+                                                                    </div>
+                                                                    <span className="text-slate-400 text-sm">
+                                                                        Total Net Hours: <span className="text-white font-bold">{totalHours}h {totalMins}m</span>
                                                                     </span>
                                                                 </div>
-                                                                <span className="text-slate-400 text-sm">
-                                                                    Total Net Hours: <span className="text-white font-bold">{totalHours}h {totalMins}m</span>
-                                                                </span>
                                                             </div>
                                                         </div>
                                                         <button
-                                                            onClick={() => exportToPDF(employee)}
+                                                            onClick={(e) => {
+                                                                e.stopPropagation(); // Prevent triggering the expand/collapse
+                                                                exportToPDF(employee);
+                                                            }}
                                                             className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-500 hover:to-emerald-500 text-white rounded-lg transition-all shadow-lg"
                                                         >
                                                             <Download size={18} />
@@ -2931,7 +3182,8 @@
                                                     </div>
                                                 </div>
                                                 
-                                                {/* Work History */}
+                                                {/* Work History - Collapsible */}
+                                                {expandedEmployees[employee.id] && (
                                                 <div className="p-6">
                                                     {filteredHistory.length === 0 ? (
                                                         <p className="text-slate-400 text-center py-8">No work history in the selected period</p>
@@ -3166,6 +3418,7 @@
                                                         </div>
                                                     )}
                                                 </div>
+                                                )}
                                             </div>
                                         );
                                     })}
@@ -3889,59 +4142,95 @@
                             
                             {/* My Tasks View */}
                             {ownerDashboardView === 'tasks' && (
-                                <div className="space-y-6">
+                                <div className="flex gap-6">
+                                    {/* Sidebar Navigation */}
+                                    <div className="w-64 flex-shrink-0">
+                                        <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-slate-700/50 p-4 sticky top-6">
+                                            <h3 className="text-lg font-bold text-white mb-4 px-2">Tasks Menu</h3>
+                                            <nav className="space-y-2">
+                                                <button
+                                                    onClick={() => setTasksSubView('business')}
+                                                    className={`w-full text-left px-4 py-3 rounded-lg font-medium transition-all ${
+                                                        tasksSubView === 'business'
+                                                            ? 'bg-blue-600 text-white'
+                                                            : 'text-slate-300 hover:bg-slate-700/50'
+                                                    }`}
+                                                >
+                                                    📋 Business Tasks
+                                                </button>
+                                                <button
+                                                    onClick={() => setTasksSubView('fromEmployees')}
+                                                    className={`w-full text-left px-4 py-3 rounded-lg font-medium transition-all flex items-center justify-between ${
+                                                        tasksSubView === 'fromEmployees'
+                                                            ? 'bg-blue-600 text-white'
+                                                            : 'text-slate-300 hover:bg-slate-700/50'
+                                                    }`}
+                                                >
+                                                    <span>👥 Tasks from Employees</span>
+                                                    {owner.employeeAssignedTasks && owner.employeeAssignedTasks.length > 0 && (
+                                                        <span className="bg-red-500 text-white text-xs font-bold px-2 py-1 rounded-full">
+                                                            {owner.employeeAssignedTasks.length}
+                                                        </span>
+                                                    )}
+                                                </button>
+                                            </nav>
+                                        </div>
+                                    </div>
+                                    
+                                    {/* Main Content Area */}
+                                    <div className="flex-1 space-y-6">
+                                        {tasksSubView === 'business' && (
+                                            <>
                                     {/* Business Selector */}
                                     <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-slate-700/50 p-6">
-                                        <div className="flex items-center justify-between mb-4">
+                                        <div className="flex items-center justify-between mb-6">
                                             <h2 className="text-2xl font-bold text-white">Tasks - Business Management</h2>
+                                            <button 
+                                                onClick={() => {
+                                                    setBusinessForm({ name: '', location: '' });
+                                                    setEditingBusinessId(null);
+                                                    setShowBusinessModal(true);
+                                                }}
+                                                className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-all flex items-center gap-2 font-medium"
+                                            >
+                                                <Plus size={18} /> Manage Businesses
+                                            </button>
                                         </div>
                                         
-                                        {owner.businesses && owner.businesses.length > 0 ? (
-                                            <div className="flex flex-col md:flex-row items-start md:items-center gap-3">
-                                                <div className="flex-1 w-full">
-                                                    <label className="block text-sm text-slate-400 mb-2">Select Business:</label>
-                                                    <select 
-                                                        value={selectedBusinessId || ''}
-                                                        onChange={(e) => setSelectedBusinessId(parseInt(e.target.value))}
-                                                        className="w-full px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-lg text-white text-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 transition-all"
-                                                    >
-                                                        {owner.businesses.map(business => (
-                                                            <option key={business.id} value={business.id}>
-                                                                {business.name}{business.location ? ` - ${business.location}` : ''}
-                                                            </option>
-                                                        ))}
-                                                    </select>
-                                                </div>
-                                                <div className="flex gap-2 mt-6">
-                                                    <button 
+                                        {/* Filter Pills */}
+                                        {owner.businesses && owner.businesses.length > 0 && (
+                                            <div className="flex items-center gap-3 flex-wrap">
+                                                <span className="text-slate-400 font-medium">Filter:</span>
+                                                <button
+                                                    onClick={() => setBusinessFilter('all')}
+                                                    className={`px-5 py-2 rounded-full font-medium transition-all ${
+                                                        businessFilter === 'all'
+                                                            ? 'bg-blue-600 text-white'
+                                                            : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'
+                                                    }`}
+                                                >
+                                                    All Tasks
+                                                </button>
+                                                {owner.businesses.map(business => (
+                                                    <button
+                                                        key={business.id}
                                                         onClick={() => {
-                                                            setBusinessForm({ name: '', location: '' });
-                                                            setEditingBusinessId(null);
-                                                            setShowBusinessModal(true);
+                                                            setBusinessFilter('single');
+                                                            setSelectedBusinessId(business.id);
                                                         }}
-                                                        className="px-4 py-3 bg-green-600 hover:bg-green-500 text-white rounded-lg transition-all flex items-center gap-2 font-medium whitespace-nowrap"
+                                                        className={`px-5 py-2 rounded-full font-medium transition-all ${
+                                                            businessFilter === 'single' && selectedBusinessId === business.id
+                                                                ? 'bg-blue-600 text-white'
+                                                                : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'
+                                                        }`}
                                                     >
-                                                        <Plus size={18} /> Add Business
+                                                        {business.name}
                                                     </button>
-                                                    {selectedBusinessId && (
-                                                        <>
-                                                            <button 
-                                                                onClick={() => handleEditBusiness(selectedBusinessId)}
-                                                                className="px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-all flex items-center gap-2 whitespace-nowrap"
-                                                            >
-                                                                <Edit2 size={18} /> Edit
-                                                            </button>
-                                                            <button 
-                                                                onClick={() => handleDeleteBusiness(selectedBusinessId)}
-                                                                className="px-4 py-3 bg-red-600 hover:bg-red-500 text-white rounded-lg transition-all flex items-center gap-2 whitespace-nowrap"
-                                                            >
-                                                                <Trash2 size={18} /> Delete
-                                                            </button>
-                                                        </>
-                                                    )}
-                                                </div>
+                                                ))}
                                             </div>
-                                        ) : (
+                                        )}
+                                        
+                                        {owner.businesses && owner.businesses.length === 0 && (
                                             <div className="text-center py-8">
                                                 <p className="text-slate-400 mb-4">No businesses yet. Add your first business to get started.</p>
                                                 <button 
@@ -3959,7 +4248,7 @@
                                     </div>
                                     
                                     {/* Business Info Banner & Tasks */}
-                                    {selectedBusinessId && (() => {
+                                    {businessFilter === 'single' && selectedBusinessId && (() => {
                                         const business = owner.businesses?.find(b => b.id === selectedBusinessId);
                                         if (!business) return (
                                             <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-slate-700/50 p-6 text-center">
@@ -4061,16 +4350,23 @@
                                                                         </div>
                                                                     ) : (
                                                                         <>
-                                                                            <span className={`flex-1 ${task.completed ? 'text-slate-500 line-through' : 'text-slate-300'}`}>
-                                                                                {task.task}
-                                                                            </span>
+                                                                            <div className="flex-1">
+                                                                                <span className={`${task.completed ? 'text-slate-500 line-through' : 'text-slate-300'}`}>
+                                                                                    {task.task}
+                                                                                </span>
+                                                                                {task.assignedTo && (
+                                                                                    <p className="text-xs text-slate-400 mt-1">
+                                                                                        Assigned to: <span className="text-green-400">{task.assignedTo.employeeName}</span>
+                                                                                    </p>
+                                                                                )}
+                                                                            </div>
                                                                             
                                                                             <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-all">
                                                                                 <div className="flex items-center gap-1 text-purple-400/50 text-xs mr-2">
                                                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                                                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 8h16M4 16h16"></path>
                                                                                     </svg>
-                                                                                    <span>Drag to reorder</span>
+                                                                                    
                                                                                 </div>
                                                                                 <button
                                                                                     onClick={() => {
@@ -4078,12 +4374,26 @@
                                                                                         setEditingTaskText(task.task);
                                                                                     }}
                                                                                     className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-blue-400"
+                                                                                    title="Edit task"
                                                                                 >
                                                                                     <Edit2 size={14} />
                                                                                 </button>
                                                                                 <button
+                                                                                    onClick={() => {
+                                                                                        setTaskToAssign({ task, businessId: business.id, taskType: 'dailyTasks' });
+                                                                                        setShowAssignTaskModal(true);
+                                                                                    }}
+                                                                                    className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-green-400"
+                                                                                    title="Assign to employee"
+                                                                                >
+                                                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                                                                                    </svg>
+                                                                                </button>
+                                                                                <button
                                                                                     onClick={() => handleDeleteOwnerTask(task.id, 'dailyTasks', business.id)}
                                                                                     className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-red-400"
+                                                                                    title="Delete task"
                                                                                 >
                                                                                     <Trash2 size={14} />
                                                                                 </button>
@@ -4180,16 +4490,23 @@
                                                                         </div>
                                                                     ) : (
                                                                         <>
-                                                                            <span className={`flex-1 ${task.completed ? 'text-slate-500 line-through' : 'text-slate-300'}`}>
-                                                                                {task.task}
-                                                                            </span>
+                                                                            <div className="flex-1">
+                                                                                <span className={`${task.completed ? 'text-slate-500 line-through' : 'text-slate-300'}`}>
+                                                                                    {task.task}
+                                                                                </span>
+                                                                                {task.assignedTo && (
+                                                                                    <p className="text-xs text-slate-400 mt-1">
+                                                                                        Assigned to: <span className="text-green-400">{task.assignedTo.employeeName}</span>
+                                                                                    </p>
+                                                                                )}
+                                                                            </div>
                                                                             
                                                                             <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-all">
                                                                                 <div className="flex items-center gap-1 text-purple-400/50 text-xs mr-2">
                                                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                                                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 8h16M4 16h16"></path>
                                                                                     </svg>
-                                                                                    <span>Drag to reorder</span>
+                                                                                    
                                                                                 </div>
                                                                                 <button
                                                                                     onClick={() => {
@@ -4197,12 +4514,26 @@
                                                                                         setEditingTaskText(task.task);
                                                                                     }}
                                                                                     className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-blue-400"
+                                                                                    title="Edit task"
                                                                                 >
                                                                                     <Edit2 size={14} />
                                                                                 </button>
                                                                                 <button
+                                                                                    onClick={() => {
+                                                                                        setTaskToAssign({ task, businessId: business.id, taskType: 'assignedTasks' });
+                                                                                        setShowAssignTaskModal(true);
+                                                                                    }}
+                                                                                    className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-green-400"
+                                                                                    title="Assign to employee"
+                                                                                >
+                                                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                                                                                    </svg>
+                                                                                </button>
+                                                                                <button
                                                                                     onClick={() => handleDeleteOwnerTask(task.id, 'assignedTasks', business.id)}
                                                                                     className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-red-400"
+                                                                                    title="Delete task"
                                                                                 >
                                                                                     <Trash2 size={14} />
                                                                                 </button>
@@ -4243,53 +4574,390 @@
                                         );
                                     })()}
                                     
-                                    {/* Add/Edit Business Modal */}
-                                    {showBusinessModal && (
-                                        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50">
-                                            <div className="bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 p-8 max-w-md w-full mx-4">
-                                                <h3 className="text-2xl font-bold text-white mb-6">
-                                                    {editingBusinessId ? 'Edit Business' : 'Add New Business'}
-                                                </h3>
-                                                <div className="space-y-4">
-                                                    <div>
-                                                        <label className="block text-sm text-slate-400 mb-2">Business Name *</label>
-                                                        <input 
-                                                            type="text"
-                                                            value={businessForm.name}
-                                                            onChange={(e) => setBusinessForm({ ...businessForm, name: e.target.value })}
-                                                            placeholder="e.g., Store A - Downtown"
-                                                            className="w-full px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-purple-500 focus:border-purple-500"
-                                                            autoFocus
-                                                        />
-                                                    </div>
-                                                    <div>
-                                                        <label className="block text-sm text-slate-400 mb-2">Location (Optional)</label>
-                                                        <input 
-                                                            type="text"
-                                                            value={businessForm.location}
-                                                            onChange={(e) => setBusinessForm({ ...businessForm, location: e.target.value })}
-                                                            placeholder="e.g., 123 Main St"
-                                                            className="w-full px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-purple-500 focus:border-purple-500"
-                                                        />
-                                                    </div>
-                                                    {error && (
-                                                        <div className="bg-red-500/10 border border-red-500/50 text-red-400 px-4 py-3 rounded-lg text-sm">
-                                                            {error}
+                                    {/* All Businesses View - Aggregated Tasks */}
+                                    {businessFilter === 'all' && owner.businesses && owner.businesses.length > 0 && (() => {
+                                        // Aggregate all tasks from all businesses
+                                        const allDailyTasks = [];
+                                        const allAssignedTasks = [];
+                                        
+                                        owner.businesses.forEach(business => {
+                                            if (business.dailyTasks) {
+                                                business.dailyTasks.forEach(task => {
+                                                    allDailyTasks.push({
+                                                        ...task,
+                                                        businessId: business.id,
+                                                        businessName: business.name,
+                                                        businessLocation: business.location
+                                                    });
+                                                });
+                                            }
+                                            if (business.assignedTasks) {
+                                                business.assignedTasks.forEach(task => {
+                                                    allAssignedTasks.push({
+                                                        ...task,
+                                                        businessId: business.id,
+                                                        businessName: business.name,
+                                                        businessLocation: business.location
+                                                    });
+                                                });
+                                            }
+                                        });
+                                        
+                                        return (
+                                            <div className="space-y-6">
+                                                {/* Summary Banner */}
+                                                <div className="bg-gradient-to-r from-purple-900/50 to-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-purple-700/50 p-6">
+                                                    <div className="flex items-center justify-between">
+                                                        <div>
+                                                            <h3 className="text-2xl font-bold text-white">All Businesses - Combined View</h3>
+                                                            <p className="text-purple-200 mt-1">📊 {owner.businesses.length} Business{owner.businesses.length !== 1 ? 'es' : ''}</p>
                                                         </div>
-                                                    )}
+                                                        <div className="flex gap-4">
+                                                            <div className="text-center bg-slate-900/50 px-4 py-2 rounded-lg">
+                                                                <div className="text-2xl font-bold text-green-400">
+                                                                    {allDailyTasks.filter(t => t.completed).length}/{allDailyTasks.length}
+                                                                </div>
+                                                                <div className="text-xs text-slate-400">Daily Tasks</div>
+                                                            </div>
+                                                            <div className="text-center bg-slate-900/50 px-4 py-2 rounded-lg">
+                                                                <div className="text-2xl font-bold text-blue-400">
+                                                                    {allAssignedTasks.filter(t => t.completed).length}/{allAssignedTasks.length}
+                                                                </div>
+                                                                <div className="text-xs text-slate-400">Assigned Tasks</div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
                                                 </div>
+                                                
+                                                {/* Aggregated Tasks Grid */}
+                                                <div className="grid md:grid-cols-2 gap-6">
+                                                    {/* All Daily Tasks */}
+                                                    <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-slate-700/50 p-6">
+                                                        <h4 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
+                                                            📋 All Daily Tasks
+                                                            <span className="text-sm font-normal text-slate-400">
+                                                                ({allDailyTasks.filter(t => t.completed).length}/{allDailyTasks.length})
+                                                            </span>
+                                                        </h4>
+                                                        
+                                                        <div className="space-y-3 mb-4">
+                                                            {allDailyTasks.length === 0 ? (
+                                                                <p className="text-slate-400 text-center py-4">No daily tasks</p>
+                                                            ) : (
+                                                                allDailyTasks.map((task) => (
+                                                                    <div 
+                                                                        key={`${task.businessId}-${task.id}`}
+                                                                        className="flex flex-col gap-2 p-3 rounded-lg bg-slate-900/30 group"
+                                                                    >
+                                                                        <div className="flex items-center gap-2">
+                                                                            <div 
+                                                                                className={`w-5 h-5 rounded border-2 flex items-center justify-center cursor-pointer transition-all flex-shrink-0 ${
+                                                                                    task.completed ? 'bg-purple-500 border-purple-500' : 'border-slate-600 hover:border-purple-500'
+                                                                                }`}
+                                                                                onClick={() => toggleOwnerTask(task.id, 'dailyTasks', task.businessId)}
+                                                                            >
+                                                                                {task.completed && <span className="text-white text-xs">✓</span>}
+                                                                            </div>
+                                                                            <span className={`flex-1 ${task.completed ? 'text-slate-500 line-through' : 'text-slate-300'}`}>
+                                                                                {task.task}
+                                                                            </span>
+                                                                            <button
+                                                                                onClick={() => {
+                                                                                    setTaskToAssign({ task, businessId: task.businessId, taskType: 'dailyTasks' });
+                                                                                    setShowAssignTaskModal(true);
+                                                                                }}
+                                                                                className="opacity-0 group-hover:opacity-100 p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-green-400 transition-all"
+                                                                                title="Assign to employee"
+                                                                            >
+                                                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                                                                                </svg>
+                                                                            </button>
+                                                                        </div>
+                                                                        <div className="ml-7 text-xs text-slate-500">
+                                                                            🏢 {task.businessName}{task.businessLocation ? ` - ${task.businessLocation}` : ''}
+                                                                        </div>
+                                                                    </div>
+                                                                ))
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                    
+                                                    {/* All Assigned Tasks */}
+                                                    <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-slate-700/50 p-6">
+                                                        <h4 className="text-xl font-bold text-white mb-4 flex items-center gap-2">
+                                                            📌 All Assigned Tasks
+                                                            <span className="text-sm font-normal text-slate-400">
+                                                                ({allAssignedTasks.filter(t => t.completed).length}/{allAssignedTasks.length})
+                                                            </span>
+                                                        </h4>
+                                                        
+                                                        <div className="space-y-3 mb-4">
+                                                            {allAssignedTasks.length === 0 ? (
+                                                                <p className="text-slate-400 text-center py-4">No assigned tasks</p>
+                                                            ) : (
+                                                                allAssignedTasks.map((task) => (
+                                                                    <div 
+                                                                        key={`${task.businessId}-${task.id}`}
+                                                                        className="flex flex-col gap-2 p-3 rounded-lg bg-slate-900/30 group"
+                                                                    >
+                                                                        <div className="flex items-center gap-2">
+                                                                            <div 
+                                                                                className={`w-5 h-5 rounded border-2 flex items-center justify-center cursor-pointer transition-all flex-shrink-0 ${
+                                                                                    task.completed ? 'bg-purple-500 border-purple-500' : 'border-slate-600 hover:border-purple-500'
+                                                                                }`}
+                                                                                onClick={() => toggleOwnerTask(task.id, 'assignedTasks', task.businessId)}
+                                                                            >
+                                                                                {task.completed && <span className="text-white text-xs">✓</span>}
+                                                                            </div>
+                                                                            <span className={`flex-1 ${task.completed ? 'text-slate-500 line-through' : 'text-slate-300'}`}>
+                                                                                {task.task}
+                                                                            </span>
+                                                                            <button
+                                                                                onClick={() => {
+                                                                                    setTaskToAssign({ task, businessId: task.businessId, taskType: 'assignedTasks' });
+                                                                                    setShowAssignTaskModal(true);
+                                                                                }}
+                                                                                className="opacity-0 group-hover:opacity-100 p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-green-400 transition-all"
+                                                                                title="Assign to employee"
+                                                                            >
+                                                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                                                                                </svg>
+                                                                            </button>
+                                                                        </div>
+                                                                        <div className="ml-7 text-xs text-slate-500">
+                                                                            🏢 {task.businessName}{task.businessLocation ? ` - ${task.businessLocation}` : ''}
+                                                                        </div>
+                                                                    </div>
+                                                                ))
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })()}
+                                    
+                                    {/* Manage Businesses Modal */}
+                                    {showBusinessModal && (
+                                        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                                            <div className="bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 p-8 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+                                                <div className="flex items-center justify-between mb-6">
+                                                    <h3 className="text-2xl font-bold text-white">
+                                                        {editingBusinessId ? 'Edit Business' : 'Manage Businesses'}
+                                                    </h3>
+                                                    <button 
+                                                        onClick={() => {
+                                                            setShowBusinessModal(false);
+                                                            setEditingBusinessId(null);
+                                                            setBusinessForm({ name: '', location: '' });
+                                                        }}
+                                                        className="text-slate-400 hover:text-white transition-colors"
+                                                    >
+                                                        <X size={24} />
+                                                    </button>
+                                                </div>
+                                                
+                                                {!editingBusinessId ? (
+                                                    <>
+                                                        {/* Add New Business Form */}
+                                                        <div className="bg-slate-900/50 rounded-xl p-6 mb-6 border border-slate-700">
+                                                            <h4 className="text-lg font-semibold text-white mb-4">Add New Business</h4>
+                                                            <div className="space-y-4">
+                                                                <div>
+                                                                    <label className="block text-sm text-slate-400 mb-2">Business Name *</label>
+                                                                    <input 
+                                                                        type="text"
+                                                                        value={businessForm.name}
+                                                                        onChange={(e) => setBusinessForm({ ...businessForm, name: e.target.value })}
+                                                                        placeholder="e.g., Tangy Shop"
+                                                                        className="w-full px-4 py-3 bg-slate-800 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                                                    />
+                                                                </div>
+                                                                <div>
+                                                                    <label className="block text-sm text-slate-400 mb-2">Location (Optional)</label>
+                                                                    <input 
+                                                                        type="text"
+                                                                        value={businessForm.location}
+                                                                        onChange={(e) => setBusinessForm({ ...businessForm, location: e.target.value })}
+                                                                        placeholder="e.g., U.S and Canada"
+                                                                        className="w-full px-4 py-3 bg-slate-800 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                                                    />
+                                                                </div>
+                                                                {error && (
+                                                                    <div className="bg-red-500/10 border border-red-500/50 text-red-400 px-4 py-3 rounded-lg text-sm">
+                                                                        {error}
+                                                                    </div>
+                                                                )}
+                                                                <button 
+                                                                    onClick={handleAddBusiness}
+                                                                    className="w-full px-4 py-3 bg-green-600 hover:bg-green-500 text-white rounded-lg transition-all font-medium flex items-center justify-center gap-2"
+                                                                >
+                                                                    <Plus size={18} /> Add Business
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                        
+                                                        {/* Existing Businesses List */}
+                                                        <div>
+                                                            <h4 className="text-lg font-semibold text-white mb-4">Existing Businesses</h4>
+                                                            {owner.businesses && owner.businesses.length > 0 ? (
+                                                                <div className="space-y-3">
+                                                                    {owner.businesses.map(business => (
+                                                                        <div key={business.id} className="bg-slate-900/50 rounded-lg p-4 border border-slate-700 flex items-center justify-between">
+                                                                            <div>
+                                                                                <h5 className="text-white font-medium">{business.name}</h5>
+                                                                                {business.location && (
+                                                                                    <p className="text-slate-400 text-sm mt-1">{business.location}</p>
+                                                                                )}
+                                                                            </div>
+                                                                            <div className="flex gap-2">
+                                                                                <button 
+                                                                                    onClick={() => handleEditBusiness(business.id)}
+                                                                                    className="px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-all flex items-center gap-1"
+                                                                                >
+                                                                                    <Edit2 size={16} /> Edit
+                                                                                </button>
+                                                                                <button 
+                                                                                    onClick={() => handleDeleteBusiness(business.id)}
+                                                                                    className="px-3 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg transition-all flex items-center gap-1"
+                                                                                >
+                                                                                    <Trash2 size={16} /> Delete
+                                                                                </button>
+                                                                            </div>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            ) : (
+                                                                <p className="text-slate-400 text-center py-8">No businesses yet. Add your first business above.</p>
+                                                            )}
+                                                        </div>
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        {/* Edit Business Form */}
+                                                        <div className="space-y-4">
+                                                            <div>
+                                                                <label className="block text-sm text-slate-400 mb-2">Business Name *</label>
+                                                                <input 
+                                                                    type="text"
+                                                                    value={businessForm.name}
+                                                                    onChange={(e) => setBusinessForm({ ...businessForm, name: e.target.value })}
+                                                                    placeholder="e.g., Store A - Downtown"
+                                                                    className="w-full px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                                                    autoFocus
+                                                                />
+                                                            </div>
+                                                            <div>
+                                                                <label className="block text-sm text-slate-400 mb-2">Location (Optional)</label>
+                                                                <input 
+                                                                    type="text"
+                                                                    value={businessForm.location}
+                                                                    onChange={(e) => setBusinessForm({ ...businessForm, location: e.target.value })}
+                                                                    placeholder="e.g., 123 Main St"
+                                                                    className="w-full px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                                                />
+                                                            </div>
+                                                            {error && (
+                                                                <div className="bg-red-500/10 border border-red-500/50 text-red-400 px-4 py-3 rounded-lg text-sm">
+                                                                    {error}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                        <div className="flex gap-3 mt-6">
+                                                            <button 
+                                                                onClick={() => {
+                                                                    setEditingBusinessId(null);
+                                                                    setBusinessForm({ name: '', location: '' });
+                                                                    setError('');
+                                                                }}
+                                                                className="flex-1 px-4 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-all"
+                                                            >
+                                                                Cancel
+                                                            </button>
+                                                            <button 
+                                                                onClick={handleUpdateBusiness}
+                                                                className="flex-1 px-4 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-all font-medium"
+                                                            >
+                                                                Update Business
+                                                            </button>
+                                                        </div>
+                                                    </>
+                                                )}
+                                            </div>
+                                        </div>
+                                    )}
+                                    
+                                    {/* Assign Task to Employee Modal */}
+                                    {showAssignTaskModal && (
+                                        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+                                            <div className="bg-slate-800 rounded-2xl shadow-2xl border border-slate-700 p-8 max-w-md w-full">
+                                                <h3 className="text-2xl font-bold text-white mb-6">Assign Task to Employee</h3>
+                                                <div className="space-y-4">
+                                                    <div className="bg-slate-900/50 p-4 rounded-lg">
+                                                        <p className="text-slate-400 text-sm mb-1">Task:</p>
+                                                        <p className="text-white font-medium">{taskToAssign?.task?.task}</p>
+                                                    </div>
+                                                    
+                                                    <div>
+                                                        <label className="block text-sm text-slate-400 mb-2">Select Employee *</label>
+                                                        <select 
+                                                            value={selectedEmployeeToAssign}
+                                                            onChange={(e) => {
+                                                                console.log('Employee selected:', e.target.value);
+                                                                setSelectedEmployeeToAssign(e.target.value);
+                                                            }}
+                                                            className="w-full px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-lg text-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                                                        >
+                                                            <option value="">Choose an employee</option>
+                                                            {employees.map(emp => (
+                                                                <option key={emp.id} value={emp.id}>{emp.name} ({emp.username})</option>
+                                                            ))}
+                                                        </select>
+                                                        <p className="text-xs text-slate-500 mt-1">Selected: {selectedEmployeeToAssign || 'None'}</p>
+                                                    </div>
+                                                    
+                                                    <div>
+                                                        <label className="block text-sm text-slate-400 mb-2">Task Type</label>
+                                                        <div className="px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-lg">
+                                                            <span className="text-white font-medium">
+                                                                {taskToAssign?.taskType === 'dailyTasks' ? '📋 Daily Task' : '✅ Assigned Task'}
+                                                            </span>
+                                                            <p className="text-xs text-slate-400 mt-1">
+                                                                {taskToAssign?.taskType === 'dailyTasks' 
+                                                                    ? 'Will reset daily for the employee'
+                                                                    : 'One-time task for the employee'
+                                                                }
+                                                            </p>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                                
                                                 <div className="flex gap-3 mt-6">
                                                     <button 
-                                                        onClick={handleCancelBusinessModal}
+                                                        onClick={() => {
+                                                            setShowAssignTaskModal(false);
+                                                            setTaskToAssign(null);
+                                                            setSelectedEmployeeToAssign('');
+                                                        }}
                                                         className="flex-1 px-4 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-all"
                                                     >
                                                         Cancel
                                                     </button>
                                                     <button 
-                                                        onClick={editingBusinessId ? handleUpdateBusiness : handleAddBusiness}
-                                                        className="flex-1 px-4 py-3 bg-green-600 hover:bg-green-500 text-white rounded-lg transition-all font-medium"
+                                                        type="button"
+                                                        onClick={(e) => {
+                                                            e.preventDefault();
+                                                            console.log('Assign button clicked!');
+                                                            console.log('Selected employee:', selectedEmployeeToAssign);
+                                                            console.log('Task to assign:', taskToAssign);
+                                                            handleAssignTaskToEmployee();
+                                                        }}
+                                                        disabled={!selectedEmployeeToAssign}
+                                                        className="flex-1 px-4 py-3 bg-green-600 hover:bg-green-500 disabled:bg-slate-600 disabled:cursor-not-allowed text-white rounded-lg transition-all font-medium"
                                                     >
-                                                        {editingBusinessId ? 'Update' : 'Add'} Business
+                                                        Assign Task
                                                     </button>
                                                 </div>
                                             </div>
@@ -4403,17 +5071,130 @@
                                             )}
                                         </div>
                                     </div>
-                                </div>
+                                </>
                             )}
                             
-                            
+                            {tasksSubView === 'fromEmployees' && (
+                                <>
+                                    {/* Tasks Assigned by Employees - New Location */}
+                                    <div className="bg-gradient-to-br from-blue-900/50 to-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl border border-blue-700/50 overflow-hidden">
+                                        <div className="bg-gradient-to-r from-blue-700/30 to-blue-800/30 p-6 border-b border-blue-700/50">
+                                            <h2 className="text-2xl font-bold text-white mb-2">Tasks from Employees</h2>
+                                            <p className="text-blue-200 text-sm">Review and manage tasks assigned to you by employees</p>
+                                        </div>
+                                        
+                                        <div className="p-6">
+                                            {owner.employeeAssignedTasks && owner.employeeAssignedTasks.length > 0 ? (
+                                                <div className="space-y-3">
+                                                    {owner.employeeAssignedTasks.map((task) => (
+                                                        <div 
+                                                            key={task.id}
+                                                            className={`p-4 rounded-lg border transition-all ${
+                                                                task.completed 
+                                                                    ? 'bg-green-500/10 border-green-500/30' 
+                                                                    : 'bg-blue-500/10 border-blue-500/30'
+                                                            }`}
+                                                        >
+                                                            <div className="flex items-start gap-3">
+                                                                <div 
+                                                                    className={`w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 mt-0.5 cursor-pointer transition-all ${
+                                                                        task.completed 
+                                                                            ? 'bg-green-500 border-green-500' 
+                                                                            : 'border-blue-400 hover:border-blue-500'
+                                                                    }`}
+                                                                    onClick={() => {
+                                                                        const updatedOwner = {
+                                                                            ...owner,
+                                                                            employeeAssignedTasks: owner.employeeAssignedTasks.map(t =>
+                                                                                t.id === task.id ? { ...t, completed: !t.completed } : t
+                                                                            )
+                                                                        };
+                                                                        setOwner(updatedOwner);
+                                                                        Storage.saveOwner(updatedOwner);
+                                                                        if (useFirebase) {
+                                                                            FirebaseDB.saveOwner(updatedOwner);
+                                                                        }
+                                                                    }}
+                                                                >
+                                                                    {task.completed && <span className="text-white text-xs">✓</span>}
+                                                                </div>
+                                                                
+                                                                <div className="flex-1">
+                                                                    <p className={`${
+                                                                        task.completed 
+                                                                            ? 'text-slate-500 line-through' 
+                                                                            : 'text-white'
+                                                                    }`}>
+                                                                        {task.task}
+                                                                    </p>
+                                                                    <p className="text-xs text-slate-400 mt-1">
+                                                                        From: <span className="text-blue-400">{task.assignedBy}</span>
+                                                                        {task.assignedAt && (
+                                                                            <span className="ml-2">
+                                                                                • {new Date(task.assignedAt).toLocaleDateString()}
+                                                                            </span>
+                                                                        )}
+                                                                    </p>
+                                                                </div>
+                                                                
+                                                                <button
+                                                                    onClick={() => {
+                                                                        if (confirm('Delete this task?')) {
+                                                                            const updatedOwner = {
+                                                                                ...owner,
+                                                                                employeeAssignedTasks: owner.employeeAssignedTasks.filter(t => t.id !== task.id)
+                                                                            };
+                                                                            setOwner(updatedOwner);
+                                                                            Storage.saveOwner(updatedOwner);
+                                                                            if (useFirebase) {
+                                                                                FirebaseDB.saveOwner(updatedOwner);
+                                                                            }
+                                                                            
+                                                                            // Also remove from employee's list
+                                                                            const updatedEmployees = employees.map(emp => {
+                                                                                if (emp.username === task.assignedBy || emp.name === task.assignedBy) {
+                                                                                    return {
+                                                                                        ...emp,
+                                                                                        tasksAssignedToOwner: (emp.tasksAssignedToOwner || []).filter(t => t.id !== task.id)
+                                                                                    };
+                                                                                }
+                                                                                return emp;
+                                                                            });
+                                                                            setEmployees(updatedEmployees);
+                                                                        }
+                                                                    }}
+                                                                    className="p-1 text-red-400 hover:text-red-300 hover:bg-red-600/20 rounded transition-all"
+                                                                    title="Delete task"
+                                                                >
+                                                                    <Trash2 size={16} />
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            ) : (
+                                                <div className="text-center py-12">
+                                                    <svg className="w-16 h-16 mx-auto text-slate-600 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"></path>
+                                                    </svg>
+                                                    <p className="text-slate-400 text-lg">No tasks assigned by employees yet</p>
+                                                    <p className="text-slate-500 text-sm mt-2">Employees can assign tasks to you from their dashboard</p>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </>
+                            )}
                         </div>
                     </div>
-                );
-            }
+                )}
+            </div>
+        </div>
+    );
+}
 
-            // Employee Dashboard
-            if (currentView === 'employeeDashboard') {
+// Employee Dashboard
+if (currentView === 'employeeDashboard') {
                 const allDailyTasksCompleted = currentEmployee.dailyTasks.every(task => task.completed);
                 
                 return (
