@@ -36,7 +36,7 @@
         
         // Initialize Firebase
         let db;
-        let useFirebase = true; // ✅ ENABLED FOR CUSTOMER SERVICE LOGS
+        let useFirebase = false;
         
         try {
             if (firebaseConfig.apiKey !== "YOUR_API_KEY") {
@@ -252,6 +252,50 @@
             
             isSessionValid: () => {
                 return SessionManager.getSession() !== null;
+            }
+        };
+
+        // Cache Manager — clears localStorage cache every 7 days
+        // Firebase remains the source of truth; this just flushes stale local copies
+        const CacheManager = {
+            CACHE_KEY: 'lastCacheCleared',
+            CACHE_INTERVAL_MS: 7 * 24 * 60 * 60 * 1000, // 7 days in milliseconds
+
+            // Keys that are safe to wipe (local caches only — not session or cache timestamp itself)
+            CLEARABLE_KEYS: [
+                'employees',
+                'owner',
+                'refundRequests',
+                'customerQueries',
+                'customerCallLogs'
+            ],
+
+            getLastCleared: () => {
+                const stored = localStorage.getItem(CacheManager.CACHE_KEY);
+                return stored ? parseInt(stored, 10) : null;
+            },
+
+            setLastCleared: () => {
+                localStorage.setItem(CacheManager.CACHE_KEY, Date.now().toString());
+            },
+
+            isDue: () => {
+                const last = CacheManager.getLastCleared();
+                if (!last) return true; // Never cleared before — do it now
+                return (Date.now() - last) >= CacheManager.CACHE_INTERVAL_MS;
+            },
+
+            clear: () => {
+                CacheManager.CLEARABLE_KEYS.forEach(key => localStorage.removeItem(key));
+                CacheManager.setLastCleared();
+                console.log('🧹 Local cache cleared (7-day interval). Firebase remains the source of truth.');
+            },
+
+            // Call this once on app startup
+            runIfDue: () => {
+                if (CacheManager.isDue()) {
+                    CacheManager.clear();
+                }
             }
         };
 
@@ -657,8 +701,11 @@
             // State for selected employee in sidebar layout
             const [selectedEmployee, setSelectedEmployee] = useState(null);
 
-            // Check for existing session on mount
+            // Check for existing session on mount + run cache cleanup if 7 days have passed
             useEffect(() => {
+                // Run cache clear check first — wipes stale localStorage so Firebase stays authoritative
+                CacheManager.runIfDue();
+
                 const session = SessionManager.getSession();
                 if (session) {
                     if (session.type === 'owner') {
@@ -738,28 +785,29 @@
                 loadData();
             }, []);
 
-            // Save employees whenever they change
+            // Save employees whenever they change — debounced to prevent race conditions
+            // and avoid flooding Firebase on every tiny state update (break timer ticks, etc.)
             useEffect(() => {
-                if (!loading && employees.length > 0) {
-                    Storage.saveEmployees(employees);
-                    
-                    if (useFirebase) {
-                        employees.forEach(emp => {
-                            FirebaseDB.saveEmployee(emp);
-                        });
-                    }
-                }
+                if (loading || employees.length === 0) return;
+                Storage.saveEmployees(employees);
+                if (!useFirebase) return;
+                const timer = setTimeout(() => {
+                    employees.forEach(emp => {
+                        FirebaseDB.saveEmployee(emp);
+                    });
+                }, 1500);
+                return () => clearTimeout(timer);
             }, [employees, loading]);
             
-            // Save owner data whenever it changes
+            // Save owner data whenever it changes — also debounced
             useEffect(() => {
-                if (!loading && owner) {
-                    Storage.saveOwner(owner);
-                    
-                    if (useFirebase) {
-                        FirebaseDB.saveOwner(owner);
-                    }
-                }
+                if (loading || !owner) return;
+                Storage.saveOwner(owner);
+                if (!useFirebase) return;
+                const timer = setTimeout(() => {
+                    FirebaseDB.saveOwner(owner);
+                }, 1500);
+                return () => clearTimeout(timer);
             }, [owner, loading]);
             
             // Break timer - auto end when time runs out
@@ -786,87 +834,68 @@
             
             // Midnight reset for employee daily tasks
             useEffect(() => {
-                if (currentView === 'employeeDashboard' && currentEmployee) {
-                    const checkMidnight = () => {
-                        const timezone = currentEmployee.schedule?.timezone || 'America/Toronto';
-                        const now = new Date();
-                        const employeeTime = new Date(now.toLocaleString('en-US', { timeZone: timezone }));
-                        
-                        // Check if it's midnight (00:00:00)
-                        const hours = employeeTime.getHours();
-                        const minutes = employeeTime.getMinutes();
-                        const seconds = employeeTime.getSeconds();
-                        
-                        if (hours === 0 && minutes === 0 && seconds === 0) {
-                            // Reset daily tasks at midnight
-                            const updatedEmployee = {
-                                ...currentEmployee,
-                                dailyTasks: currentEmployee.dailyTasks.map(task => ({
-                                    ...task,
-                                    completed: false
-                                }))
-                            };
-                            
-                            // Update in employees array
-                            const updatedEmployees = employees.map(emp =>
-                                emp.id === currentEmployee.id ? updatedEmployee : emp
-                            );
-                            setEmployees(updatedEmployees);
-                            setCurrentEmployee(updatedEmployee);
-                        }
-                    };
-                    
-                    // Check every second
-                    const interval = setInterval(checkMidnight, 1000);
-                    return () => clearInterval(interval);
-                }
-            }, [currentView, currentEmployee, employees]);
+                if (currentView !== 'employeeDashboard' || !currentEmployee) return;
+
+                const timezone = currentEmployee.schedule?.timezone || 'America/Toronto';
+
+                const getDateString = () => {
+                    const now = new Date();
+                    return new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(now);
+                };
+
+                // Store today's date to detect when day changes
+                let lastDate = getDateString();
+
+                const interval = setInterval(() => {
+                    const currentDate = getDateString();
+                    if (currentDate !== lastDate) {
+                        lastDate = currentDate;
+                        // Day has changed — reset daily tasks
+                        const updatedEmployee = {
+                            ...currentEmployee,
+                            dailyTasks: currentEmployee.dailyTasks.map(task => ({ ...task, completed: false }))
+                        };
+                        const updatedEmployees = employees.map(emp =>
+                            emp.id === currentEmployee.id ? updatedEmployee : emp
+                        );
+                        setEmployees(updatedEmployees);
+                        setCurrentEmployee(updatedEmployee);
+                    }
+                }, 60000); // Check every 60 seconds — reliable and not battery-draining
+
+                return () => clearInterval(interval);
+            }, [currentView, currentEmployee?.id, currentEmployee?.schedule?.timezone]);
             
             // Midnight reset for owner daily tasks (EST timezone)
             useEffect(() => {
-                if (currentView === 'ownerDashboard' && owner) {
-                    const checkMidnight = () => {
-                        const now = new Date();
-                        const estTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-                        
-                        // Check if it's midnight EST (00:00:00)
-                        const hours = estTime.getHours();
-                        const minutes = estTime.getMinutes();
-                        const seconds = estTime.getSeconds();
-                        
-                        if (hours === 0 && minutes === 0 && seconds === 0) {
-                            // Reset owner daily tasks at midnight EST
-                            const updatedOwner = {
-                                ...owner,
-                                dailyTasks: owner.dailyTasks.map(task => ({
-                                    ...task,
-                                    completed: false
-                                }))
-                            };
-                            setOwner(updatedOwner);
-                        }
-                    };
-                    
-                    // Check every second
-                    const interval = setInterval(checkMidnight, 1000);
-                    return () => clearInterval(interval);
-                }
-            }, [currentView, owner]);
+                if (currentView !== 'ownerDashboard' || !owner) return;
 
-            // Debug: Log when assign modal opens
-            useEffect(() => {
-                if (showAssignTaskModal) {
-                    console.log('=== Assign Modal Opened ===');
-                    console.log('taskToAssign:', taskToAssign);
-                    console.log('selectedEmployeeToAssign:', selectedEmployeeToAssign);
-                    console.log('employees:', employees);
-                }
-            }, [showAssignTaskModal]);
+                const getDateString = () => {
+                    const now = new Date();
+                    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
+                };
+
+                let lastDate = getDateString();
+
+                const interval = setInterval(() => {
+                    const currentDate = getDateString();
+                    if (currentDate !== lastDate) {
+                        lastDate = currentDate;
+                        const updatedOwner = {
+                            ...owner,
+                            dailyTasks: (owner.dailyTasks || []).map(task => ({ ...task, completed: false }))
+                        };
+                        setOwner(updatedOwner);
+                    }
+                }, 60000);
+
+                return () => clearInterval(interval);
+            }, [currentView, owner?.username]);
 
 
             const handleOwnerLogin = (e) => {
                 e.preventDefault();
-                const owner = Storage.getOwner();
+                // Use the already-loaded owner state (from Firebase) instead of stale localStorage
                 if (loginForm.username === owner.username && loginForm.password === owner.password) {
                     SessionManager.saveSession('owner', { username: owner.username });
                     setCurrentView('ownerDashboard');
@@ -973,7 +1002,6 @@
             
             const handleVerifyUsername = (e) => {
                 e.preventDefault();
-                const owner = Storage.getOwner();
                 if (resetUsername === owner.username) {
                     // Generate 6-digit verification code
                     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
@@ -1188,13 +1216,6 @@
                 }
                 
                 const totalMinutesWorked = (now - clockInDate) / (1000 * 60);
-                
-                // Validation: Prevent unrealistic work sessions (> 24 hours blocked, > 16 hours warning)
-                if (totalMinutesWorked > 24 * 60) {
-                    setError('❌ Error: Work session is over 24 hours! This is not allowed. Please contact your manager to manually fix your clock-in time.');
-                    setTimeout(() => setError(''), 6000);
-                    return;
-                }
                 
                 // Warning for shifts over 16 hours
                 if (totalMinutesWorked > 16 * 60) {
@@ -1697,16 +1718,23 @@
 
             const handleAddDailyTask = (employeeId) => {
                 if (newDailyTask.trim()) {
+                    const newTask = { id: Date.now(), task: newDailyTask, completed: false };
                     const updatedEmployees = employees.map(emp => {
                         if (emp.id === employeeId) {
                             return {
                                 ...emp,
-                                dailyTasks: [...emp.dailyTasks, { id: Date.now(), task: newDailyTask, completed: false }]
+                                dailyTasks: [...emp.dailyTasks, newTask]
                             };
                         }
                         return emp;
                     });
                     setEmployees(updatedEmployees);
+                    if (currentEmployee && currentEmployee.id === employeeId) {
+                        setCurrentEmployee(prev => ({
+                            ...prev,
+                            dailyTasks: [...prev.dailyTasks, newTask]
+                        }));
+                    }
                     setNewDailyTask('');
                 }
             };
@@ -1722,20 +1750,34 @@
                     return emp;
                 });
                 setEmployees(updatedEmployees);
+                // Keep currentEmployee in sync so stale state can't overwrite this deletion
+                if (currentEmployee && currentEmployee.id === employeeId) {
+                    setCurrentEmployee(prev => ({
+                        ...prev,
+                        dailyTasks: prev.dailyTasks.filter(task => task.id !== taskId)
+                    }));
+                }
             };
 
             const handleAddAssignedTask = (employeeId) => {
                 if (newAssignedTask.trim()) {
+                    const newTask = { id: Date.now(), task: newAssignedTask, completed: false };
                     const updatedEmployees = employees.map(emp => {
                         if (emp.id === employeeId) {
                             return {
                                 ...emp,
-                                assignedTasks: [...emp.assignedTasks, { id: Date.now(), task: newAssignedTask, completed: false }]
+                                assignedTasks: [...emp.assignedTasks, newTask]
                             };
                         }
                         return emp;
                     });
                     setEmployees(updatedEmployees);
+                    if (currentEmployee && currentEmployee.id === employeeId) {
+                        setCurrentEmployee(prev => ({
+                            ...prev,
+                            assignedTasks: [...prev.assignedTasks, newTask]
+                        }));
+                    }
                     setNewAssignedTask('');
                 }
             };
@@ -1751,6 +1793,13 @@
                     return emp;
                 });
                 setEmployees(updatedEmployees);
+                // Keep currentEmployee in sync so stale state can't overwrite this deletion
+                if (currentEmployee && currentEmployee.id === employeeId) {
+                    setCurrentEmployee(prev => ({
+                        ...prev,
+                        assignedTasks: prev.assignedTasks.filter(task => task.id !== taskId)
+                    }));
+                }
             };
             
             const handleUpdateTaskText = (employeeId, taskId, newText, taskType) => {
@@ -1768,6 +1817,15 @@
                     return emp;
                 });
                 setEmployees(updatedEmployees);
+                // Keep currentEmployee in sync so stale state can't overwrite this edit
+                if (currentEmployee && currentEmployee.id === employeeId) {
+                    setCurrentEmployee(prev => ({
+                        ...prev,
+                        [taskType]: prev[taskType].map(task =>
+                            task.id === taskId ? { ...task, task: newText } : task
+                        )
+                    }));
+                }
                 setEditingTaskId(null);
                 setEditingTaskText('');
             };
