@@ -3846,6 +3846,13 @@
                                                                 <div className="flex gap-2">
                                                                     <input
                                                                         type="text"
+                                                                        value={editFormData.name || ''}
+                                                                        onChange={(e) => setEditFormData({...editFormData, name: e.target.value})}
+                                                                        className="px-3 py-1 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
+                                                                        placeholder="Full Name"
+                                                                    />
+                                                                    <input
+                                                                        type="text"
                                                                         value={editFormData.username || ''}
                                                                         onChange={(e) => setEditFormData({...editFormData, username: e.target.value})}
                                                                         className="px-3 py-1 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
@@ -3860,6 +3867,7 @@
                                                                     />
                                                                     <button
                                                                         onClick={() => handleUpdateEmployee(employee.id, {
+                                                                            name: editFormData.name,
                                                                             username: editFormData.username,
                                                                             password: editFormData.password,
                                                                             phone: editFormData.phone,
@@ -4114,6 +4122,7 @@
                                                                 onClick={() => {
                                                                     setEditingEmployee(employee.id);
                                                                     setEditFormData({
+                                                                        name: employee.name,
                                                                         username: employee.username,
                                                                         password: employee.password,
                                                                         phone: employee.phone || '',
