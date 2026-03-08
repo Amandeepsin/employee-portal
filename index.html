@@ -250,9 +250,7 @@
                 localStorage.removeItem('userSession');
             },
             
-            isSessionValid: () => {
-                return SessionManager.getSession() !== null;
-            }
+
         };
 
         // Cache Manager — clears localStorage cache every 7 days
@@ -265,8 +263,6 @@
             CLEARABLE_KEYS: [
                 'employees',
                 'owner',
-                'refundRequests',
-                'customerQueries',
                 'customerCallLogs'
             ],
 
@@ -399,23 +395,7 @@
             },
             
             // Customer Service Data
-            getRefundRequests: () => {
-                const stored = localStorage.getItem('refundRequests');
-                return stored ? JSON.parse(stored) : [];
-            },
-            
-            saveRefundRequests: (requests) => {
-                localStorage.setItem('refundRequests', JSON.stringify(requests));
-            },
-            
-            getCustomerQueries: () => {
-                const stored = localStorage.getItem('customerQueries');
-                return stored ? JSON.parse(stored) : [];
-            },
-            
-            saveCustomerQueries: (queries) => {
-                localStorage.setItem('customerQueries', JSON.stringify(queries));
-            },
+
             
             getCustomerCallLogs: () => {
                 const stored = localStorage.getItem('customerCallLogs');
@@ -429,26 +409,29 @@
 
         // Firebase helper functions
         const FirebaseDB = {
-            loadOwner: async (setOwner) => {
+            loadOwner: (setOwner) => {
                 if (!useFirebase) {
                     setOwner(Storage.getOwner());
-                    return;
+                    return () => {};
                 }
                 
-                try {
-                    const doc = await db.collection('owner').doc('ownerData').get();
-                    if (doc.exists) {
-                        setOwner(doc.data());
-                    } else {
-                        // Initialize with default owner
-                        const defaultOwner = Storage.getOwner();
-                        await db.collection('owner').doc('ownerData').set(defaultOwner);
-                        setOwner(defaultOwner);
+                const unsubscribe = db.collection('owner').doc('ownerData').onSnapshot(
+                    (doc) => {
+                        if (doc.exists) {
+                            setOwner(doc.data());
+                        } else {
+                            // Initialize with default owner
+                            const defaultOwner = Storage.getOwner();
+                            db.collection('owner').doc('ownerData').set(defaultOwner);
+                            setOwner(defaultOwner);
+                        }
+                    },
+                    (error) => {
+                        console.error("Error in owner listener:", error);
+                        setOwner(Storage.getOwner());
                     }
-                } catch (error) {
-                    console.error("Error loading owner:", error);
-                    setOwner(Storage.getOwner());
-                }
+                );
+                return unsubscribe;
             },
             
             saveOwner: async (owner) => {
@@ -463,33 +446,45 @@
                 }
             },
             
-            loadEmployees: async (setEmployees) => {
+            loadEmployees: (setEmployees) => {
                 if (!useFirebase) {
                     setEmployees(Storage.getEmployees());
-                    return;
+                    return () => {};
                 }
                 
-                try {
-                    const snapshot = await db.collection('employees').get();
-                    const employees = [];
-                    snapshot.forEach(doc => {
-                        employees.push({ ...doc.data(), id: doc.id });
-                    });
-                    
-                    if (employees.length === 0) {
-                        // Initialize with default employees
-                        const defaultEmployees = Storage.getEmployees();
-                        for (const emp of defaultEmployees) {
-                            await db.collection('employees').doc(emp.id.toString()).set(emp);
+                const unsubscribe = db.collection('employees').onSnapshot(
+                    (snapshot) => {
+                        const employees = [];
+                        snapshot.forEach(doc => {
+                            employees.push({ ...doc.data(), id: doc.id });
+                        });
+                        
+                        if (employees.length === 0) {
+                            // Initialize with default employees on first run
+                            const defaultEmployees = Storage.getEmployees();
+                            const batch = db.batch();
+                            defaultEmployees.forEach((emp, index) => {
+                                const docRef = db.collection('employees').doc(emp.id.toString());
+                                batch.set(docRef, { ...emp, order: index });
+                            });
+                            batch.commit();
+                            setEmployees(defaultEmployees.map((emp, index) => ({ ...emp, order: index })));
+                        } else {
+                            // Sort by explicit order field; fall back to array position for employees without it
+                            const sorted = employees.slice().sort((a, b) => {
+                                const aOrder = a.order !== undefined ? a.order : 9999;
+                                const bOrder = b.order !== undefined ? b.order : 9999;
+                                return aOrder - bOrder;
+                            });
+                            setEmployees(sorted);
                         }
-                        setEmployees(defaultEmployees);
-                    } else {
-                        setEmployees(employees);
+                    },
+                    (error) => {
+                        console.error("Error in employees listener:", error);
+                        setEmployees(Storage.getEmployees());
                     }
-                } catch (error) {
-                    console.error("Error loading employees:", error);
-                    setEmployees(Storage.getEmployees());
-                }
+                );
+                return unsubscribe;
             },
             
             saveEmployee: async (employee) => {
@@ -612,18 +607,6 @@
             const [employees, setEmployees] = useState([]);
             
             // Customer Service States
-            const [refundRequests, setRefundRequests] = useState([]);
-            const [customerQueries, setCustomerQueries] = useState([]);
-            const [newRefundRequest, setNewRefundRequest] = useState({
-                customerName: '',
-                customerEmail: '',
-                orderNumber: '',
-                amount: '',
-                reason: '',
-                requestedBy: '',
-                otherReasonText: ''
-            });
-            const [csFilter, setCsFilter] = useState('all'); // filter for call logs
             
             // Customer Service Call Logging
             const [customerCallLog, setCustomerCallLog] = useState({
@@ -640,10 +623,7 @@
             const [customerCallLogs, setCustomerCallLogs] = useState([]);
             
             // CS Filters for Owner
-            const [csSearchTerm, setCsSearchTerm] = useState('');
-            const [csFilterEmployee, setCsFilterEmployee] = useState('all');
-            const [csFilterDate, setCsFilterDate] = useState('all'); // 'today', 'week', 'month', 'all'
-            const [csFilterStatus, setCsFilterStatus] = useState('all'); // 'resolved', 'pending', 'escalated', 'all'
+
             
             const [owner, setOwner] = useState(Storage.getOwner());
             const [currentEmployee, setCurrentEmployee] = useState(null);
@@ -688,7 +668,6 @@
             
             // New state for date range filter and editing work history
             const [dateRangeFilter, setDateRangeFilter] = useState({ start: '', end: '' });
-            const [employeeDateFilter, setEmployeeDateFilter] = useState({ start: '', end: '' });
             const [editingWorkEntry, setEditingWorkEntry] = useState(null);
             const [editingWorkTimes, setEditingWorkTimes] = useState({ clockInDate: '', clockInTime: '', clockOutDate: '', clockOutTime: '', breakMinutes: '' });
             const [addingWorkHistoryTo, setAddingWorkHistoryTo] = useState(null);
@@ -718,32 +697,24 @@
                         setCurrentView('ownerDashboard');
                         // Load customer service data from Firebase
                         const loadCSData = async () => {
-                            const savedRefunds = Storage.getRefundRequests();
-                            const savedQueries = Storage.getCustomerQueries();
-                            const callLogs = await FirebaseDB.loadCallLogs(); // ✅ Load from Firebase
-                            
-                            if (savedRefunds) setRefundRequests(savedRefunds);
-                            if (savedQueries) setCustomerQueries(savedQueries);
+                            const callLogs = await FirebaseDB.loadCallLogs();
                             if (callLogs) setCustomerCallLogs(callLogs);
-                            
-                            // Cleanup old logs (runs in background)
                             FirebaseDB.cleanupOldCallLogs();
                         };
                         loadCSData();
                     } else if (session.type === 'employee') {
-                        // Find the employee in the data
-                        const loadEmployeeSession = async () => {
-                            await FirebaseDB.loadEmployees(setEmployees);
-                            // We'll set the employee after data loads
-                        };
-                        loadEmployeeSession();
+                        // Employee data will be loaded by the main onSnapshot listener in the load useEffect
+                        // Session restore happens in the employees useEffect once data arrives
                     }
                 }
             }, []);
 
-            // Restore employee session after employees are loaded
+            // Restore employee session after employees are loaded + keep currentEmployee in sync with Firebase
             useEffect(() => {
-                if (employees.length > 0 && currentView === 'selectRole') {
+                if (employees.length === 0) return;
+
+                // Session restore on first load
+                if (currentView === 'selectRole') {
                     const session = SessionManager.getSession();
                     if (session && session.type === 'employee') {
                         const employee = employees.find(emp => emp.id === session.data.id);
@@ -752,43 +723,83 @@
                             setCurrentView('employeeDashboard');
                         }
                     }
+                    return;
+                }
+
+                // Keep currentEmployee in sync with live Firebase data (Fix: owner changes reflect on employee side)
+                if (currentEmployee && currentView === 'employeeDashboard') {
+                    const freshEmployee = employees.find(emp => emp.id === currentEmployee.id);
+                    if (freshEmployee) {
+                        // Only update if something actually changed to avoid re-render loops
+                        if (JSON.stringify(freshEmployee) !== JSON.stringify(currentEmployee)) {
+                            // Preserve local clock state if employee is actively clocked in to avoid overwriting in-flight state
+                            const merged = {
+                                ...freshEmployee,
+                                // If locally clocked in but Firebase hasn't caught up yet, keep local clock state
+                                clockedIn: currentEmployee.clockedIn || freshEmployee.clockedIn,
+                                clockInTime: currentEmployee.clockedIn ? currentEmployee.clockInTime : freshEmployee.clockInTime,
+                            };
+                            setCurrentEmployee(merged);
+                        }
+                    }
                 }
             }, [employees]);
             
             // Initialize businesses (migration for existing data)
+            // Runs when owner loads from Firebase to avoid reading stale localStorage
             useEffect(() => {
-                const currentOwner = Storage.getOwner();
-                if (!currentOwner.businesses || currentOwner.businesses.length === 0) {
+                if (!owner || loading) return;
+                if (!owner.businesses || owner.businesses.length === 0) {
                     const defaultBusiness = {
                         id: Date.now(),
                         name: "My Business",
                         location: "",
                         createdAt: new Date().toISOString(),
-                        dailyTasks: currentOwner.dailyTasks || [],
-                        assignedTasks: currentOwner.assignedTasks || []
+                        dailyTasks: owner.dailyTasks || [],
+                        assignedTasks: owner.assignedTasks || []
                     };
                     
                     const updatedOwner = {
-                        ...currentOwner,
+                        ...owner,
                         businesses: [defaultBusiness]
                     };
                     
                     setOwner(updatedOwner);
                     Storage.saveOwner(updatedOwner);
+                    if (useFirebase) FirebaseDB.saveOwner(updatedOwner);
                     setSelectedBusinessId(defaultBusiness.id);
-                } else if (selectedBusinessId === null && currentOwner.businesses && currentOwner.businesses.length > 0) {
-                    setSelectedBusinessId(currentOwner.businesses[0].id);
+                } else if (selectedBusinessId === null && owner.businesses && owner.businesses.length > 0) {
+                    setSelectedBusinessId(owner.businesses[0].id);
                 }
-            }, []);
+            }, [owner?.username, loading]);
 
             // Load data on mount
             useEffect(() => {
-                const loadData = async () => {
-                    await FirebaseDB.loadOwner(setOwner);
-                    await FirebaseDB.loadEmployees(setEmployees);
-                    setLoading(false);
+                let unsubOwner = () => {};
+                let unsubEmployees = () => {};
+                let ownerLoaded = false;
+                let employeesLoaded = false;
+
+                const checkLoaded = () => {
+                    if (ownerLoaded && employeesLoaded) setLoading(false);
                 };
-                loadData();
+
+                unsubOwner = FirebaseDB.loadOwner((data) => {
+                    setOwner(data);
+                    ownerLoaded = true;
+                    checkLoaded();
+                });
+
+                unsubEmployees = FirebaseDB.loadEmployees((data) => {
+                    setEmployees(data);
+                    employeesLoaded = true;
+                    checkLoaded();
+                });
+
+                return () => {
+                    unsubOwner();
+                    unsubEmployees();
+                };
             }, []);
 
             // Save employees whenever they change — debounced to prevent race conditions
@@ -872,13 +883,13 @@
                 return () => clearInterval(interval);
             }, [currentView, currentEmployee?.id, currentEmployee?.schedule?.timezone]);
             
-            // Midnight reset for owner daily tasks (EST timezone)
+            // Midnight reset for owner daily tasks (Toronto timezone)
             useEffect(() => {
                 if (currentView !== 'ownerDashboard' || !owner) return;
 
                 const getDateString = () => {
                     const now = new Date();
-                    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
+                    return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Toronto' }).format(now);
                 };
 
                 let lastDate = getDateString();
@@ -889,7 +900,13 @@
                         lastDate = currentDate;
                         const updatedOwner = {
                             ...owner,
-                            dailyTasks: (owner.dailyTasks || []).map(task => ({ ...task, completed: false }))
+                            // Reset legacy top-level tasks (if any)
+                            dailyTasks: (owner.dailyTasks || []).map(task => ({ ...task, completed: false })),
+                            // Reset daily tasks inside each business
+                            businesses: (owner.businesses || []).map(business => ({
+                                ...business,
+                                dailyTasks: (business.dailyTasks || []).map(task => ({ ...task, completed: false }))
+                            }))
                         };
                         setOwner(updatedOwner);
                     }
@@ -1172,12 +1189,23 @@
                 
                 if (currentEmployee.schedule && currentEmployee.schedule.openingTime) {
                     const [hours, minutes] = currentEmployee.schedule.openingTime.split(':');
-                    const scheduledTime = new Date(now);
-                    scheduledTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+                    const timezone = currentEmployee.schedule.timezone || 'America/Toronto';
                     
-                    if (now > scheduledTime) {
+                    // Get current time in the employee's timezone as a date string
+                    const nowInTz = new Intl.DateTimeFormat('en-CA', {
+                        timeZone: timezone,
+                        year: 'numeric', month: '2-digit', day: '2-digit'
+                    }).format(now);
+                    
+                    // Build scheduled time in employee's timezone
+                    const scheduledTime = new Date(`${nowInTz}T${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:00`);
+                    // Adjust for timezone offset difference
+                    const tzOffset = new Date(now.toLocaleString('en-US', { timeZone: timezone })) - new Date(now.toLocaleString('en-US', { timeZone: 'UTC' }));
+                    const scheduledUTC = new Date(scheduledTime.getTime() - tzOffset);
+                    
+                    if (now > scheduledUTC) {
                         isLate = true;
-                        minutesLate = Math.floor((now - scheduledTime) / (1000 * 60));
+                        minutesLate = Math.floor((now - scheduledUTC) / (1000 * 60));
                     }
                 }
                 
@@ -1215,8 +1243,12 @@
                 
                 const totalMinutesWorked = (now - clockInDate) / (1000 * 60);
                 
-                // Calculate hours worked (total time, no break subtraction)
+                // Calculate gross hours (break deduction happens at display time using assignedBreakMinutes)
                 const hoursWorked = (totalMinutesWorked / 60).toFixed(2);
+                
+                // Capture actual break time used during this session
+                const breakTimeUsed = currentEmployee.breakTimeUsed || 0;
+                const assignedBreakMinutes = currentEmployee.assignedBreakMinutes || 30;
                 
                 // Create work history entry
                 const workEntry = {
@@ -1225,6 +1257,8 @@
                     clockIn: currentEmployee.clockInTime,
                     clockOut: now.toISOString(),
                     hoursWorked: parseFloat(hoursWorked),
+                    assignedBreakMinutes: assignedBreakMinutes,
+                    breakTimeUsed: parseFloat(breakTimeUsed.toFixed(2)),
                     wasLate: currentEmployee.isLateToday || false,
                     minutesLate: currentEmployee.minutesLate || 0
                 };
@@ -1380,9 +1414,12 @@
                         businesses: owner.businesses.map(business => ({
                             ...business,
                             dailyTasks: business.dailyTasks.map(ownerTask => {
-                                // If this owner task is assigned to current employee and has same text
-                                if (ownerTask.assignedTo?.employeeId === currentEmployee.id && 
-                                    ownerTask.task === task.task) {
+                                // Match by sourceTaskId if available, otherwise fall back to employeeId+text
+                                const matchById = task.sourceTaskId && ownerTask.id === task.sourceTaskId;
+                                const matchByText = !task.sourceTaskId && 
+                                    ownerTask.assignedTo?.employeeId === currentEmployee.id && 
+                                    ownerTask.task === task.task;
+                                if (matchById || matchByText) {
                                     return { ...ownerTask, completed: !task.completed };
                                 }
                                 return ownerTask;
@@ -1417,9 +1454,12 @@
                         businesses: owner.businesses.map(business => ({
                             ...business,
                             assignedTasks: business.assignedTasks.map(ownerTask => {
-                                // If this owner task is assigned to current employee and has same text
-                                if (ownerTask.assignedTo?.employeeId === currentEmployee.id && 
-                                    ownerTask.task === task.task) {
+                                // Match by sourceTaskId if available, otherwise fall back to employeeId+text
+                                const matchById = task.sourceTaskId && ownerTask.id === task.sourceTaskId;
+                                const matchByText = !task.sourceTaskId &&
+                                    ownerTask.assignedTo?.employeeId === currentEmployee.id && 
+                                    ownerTask.task === task.task;
+                                if (matchById || matchByText) {
                                     return { ...ownerTask, completed: !task.completed };
                                 }
                                 return ownerTask;
@@ -1620,7 +1660,14 @@
             const handleDeleteEmployee = async (employeeId) => {
                 if (window.confirm('Are you sure you want to delete this employee?')) {
                     setEmployees(employees.filter(emp => emp.id !== employeeId));
-                    await FirebaseDB.deleteEmployee(employeeId);
+                    // Clear selectedEmployee if the deleted one was selected
+                    if (selectedEmployee === employeeId) {
+                        setSelectedEmployee(null);
+                    }
+                    // Only call Firebase delete if Firebase is enabled
+                    if (useFirebase) {
+                        await FirebaseDB.deleteEmployee(employeeId);
+                    }
                 }
             };
             
@@ -1692,10 +1739,11 @@
                     });
                     setEmployees(updatedEmployees);
                     
-                    // Sign out the employee
-                    SessionManager.clearSession(employee.username);
+                    // Note: Employee session is stored in their own browser's localStorage
+                    // It cannot be cleared remotely. The employee will see they are clocked out
+                    // the next time they open the portal (their clockedIn status is now false in Firebase).
                     
-                    alert('Employee has been clocked out and signed out successfully!');
+                    alert('Employee has been clocked out successfully! Their session will reflect this the next time they open the portal.');
                 }
             };
 
@@ -1813,30 +1861,7 @@
                 setEditingTaskText('');
             };
             
-            const handleMoveTask = (employeeId, taskId, direction, taskType) => {
-                const updatedEmployees = employees.map(emp => {
-                    if (emp.id === employeeId) {
-                        const tasks = [...emp[taskType]];
-                        const currentIndex = tasks.findIndex(t => t.id === taskId);
-                        
-                        if (currentIndex === -1) return emp;
-                        
-                        const newIndex = direction === 'up' ? currentIndex - 1 : currentIndex + 1;
-                        
-                        if (newIndex < 0 || newIndex >= tasks.length) return emp;
-                        
-                        // Swap tasks
-                        [tasks[currentIndex], tasks[newIndex]] = [tasks[newIndex], tasks[currentIndex]];
-                        
-                        return {
-                            ...emp,
-                            [taskType]: tasks
-                        };
-                    }
-                    return emp;
-                });
-                setEmployees(updatedEmployees);
-            };
+
             
             const handleMoveEmployee = (employeeId, direction) => {
                 const currentIndex = employees.findIndex(emp => emp.id === employeeId);
@@ -1847,11 +1872,23 @@
                 
                 if (newIndex < 0 || newIndex >= employees.length) return;
                 
-                // Create new array with swapped positions
+                // Swap positions
                 const newEmployees = [...employees];
                 [newEmployees[currentIndex], newEmployees[newIndex]] = [newEmployees[newIndex], newEmployees[currentIndex]];
                 
-                setEmployees(newEmployees);
+                // Assign explicit order values so onSnapshot sorts correctly
+                const ordered = newEmployees.map((emp, index) => ({ ...emp, order: index }));
+                setEmployees(ordered);
+                
+                // Persist order to Firebase immediately (don't wait for debounce)
+                if (useFirebase) {
+                    const batch = db.batch();
+                    ordered.forEach(emp => {
+                        const docRef = db.collection('employees').doc(emp.id.toString());
+                        batch.update(docRef, { order: emp.order });
+                    });
+                    batch.commit().catch(err => console.error('Error saving employee order:', err));
+                }
             };
             
             // ==========================================
@@ -2013,30 +2050,14 @@
             
             // Function to assign owner's task to an employee
             const handleAssignTaskToEmployee = async () => {
-                console.log('Assigning task...', {
-                    selectedEmployeeToAssign,
-                    taskToAssign
-                });
+                if (!selectedEmployeeToAssign || !taskToAssign) return;
                 
-                if (!selectedEmployeeToAssign || !taskToAssign) {
-                    console.log('Missing required fields');
-                    return;
-                }
-                
-                // Try both strict and loose equality
                 let employee = employees.find(emp => emp.id == selectedEmployeeToAssign);
                 
-                console.log('Looking for employee with ID:', selectedEmployeeToAssign);
-                console.log('Available employees:', employees.map(e => ({ id: e.id, name: e.name, type: typeof e.id })));
-                console.log('Found employee:', employee);
-                
                 if (!employee) {
-                    console.log('Employee not found!');
                     alert('Error: Could not find employee. Please try again.');
                     return;
                 }
-                
-                console.log('Found employee:', employee);
                 
                 // Get the task type from taskToAssign (dailyTasks or assignedTasks)
                 const targetTaskType = taskToAssign.taskType;
@@ -2053,14 +2074,13 @@
                     return;
                 }
                 
-                // Add task to employee's task list
+                // Add task to employee's task list (store sourceTaskId for reliable sync)
                 const newTask = {
                     id: Date.now(),
                     task: taskToAssign.task.task,
-                    completed: false
+                    completed: false,
+                    sourceTaskId: taskToAssign.task.id
                 };
-                
-                console.log('New task to add:', newTask, 'to', targetTaskType);
                 
                 const updatedEmployees = employees.map(emp => {
                     if (emp.id == selectedEmployeeToAssign) {
@@ -2072,8 +2092,6 @@
                     }
                     return emp;
                 });
-                
-                console.log('Updated employees:', updatedEmployees);
                 
                 setEmployees(updatedEmployees);
                 Storage.saveEmployees(updatedEmployees);
@@ -2089,7 +2107,6 @@
                 }
                 
                 const taskTypeName = targetTaskType === 'dailyTasks' ? 'Daily Task' : 'Assigned Task';
-                console.log('Task assigned successfully!');
                 
                 // Mark the owner's task as assigned
                 const updatedOwner = {
@@ -2232,7 +2249,6 @@
             // Better Drag and Drop with Placeholder approach
             const [draggedTaskId, setDraggedTaskId] = useState(null);
             const [draggedTaskType, setDraggedTaskType] = useState(null);
-            const [dragOverTaskId, setDragOverTaskId] = useState(null);
             
             const handleDragStartOwner = (e, taskId, taskType) => {
                 e.dataTransfer.effectAllowed = 'move';
@@ -2299,17 +2315,18 @@
                 setDraggedTaskType(null);
                 setDragOverTaskId(null);
                 
-                // Save to storage
-                const updatedOwner = { ...owner };
-                Storage.saveOwner(updatedOwner);
-                if (useFirebase) {
-                    FirebaseDB.saveOwner(updatedOwner);
-                }
+                // Use functional setOwner to get latest state (not stale closure)
+                setOwner(latestOwner => {
+                    Storage.saveOwner(latestOwner);
+                    if (useFirebase) {
+                        FirebaseDB.saveOwner(latestOwner);
+                    }
+                    return latestOwner;
+                });
             };
             
             // Employee Tasks Drag and Drop
             const [draggedEmployeeTask, setDraggedEmployeeTask] = useState(null);
-            const [dragOverEmployeeTask, setDragOverEmployeeTask] = useState(null);
             
             const handleDragStartEmployee = (e, employeeId, taskId, taskType) => {
                 e.dataTransfer.effectAllowed = 'move';
@@ -2371,72 +2388,40 @@
                 setDraggedEmployeeTask(null);
                 setDragOverEmployeeTask(null);
                 
-                // Save to storage
-                const updatedEmployees = [...employees];
-                Storage.saveEmployees(updatedEmployees);
-                if (useFirebase) {
-                    updatedEmployees.forEach(emp => {
-                        FirebaseDB.saveEmployee(emp);
-                    });
-                }
-            };
-            
-            // Keep old move functions for backwards compatibility (not used in UI anymore)
-            const handleMoveOwnerTask = (taskId, direction, taskType) => {
-                const tasks = [...owner[taskType]];
-                const currentIndex = tasks.findIndex(t => t.id === taskId);
-                
-                if (currentIndex === -1) return;
-                
-                const newIndex = direction === 'up' ? currentIndex - 1 : currentIndex + 1;
-                
-                if (newIndex < 0 || newIndex >= tasks.length) return;
-                
-                // Swap tasks
-                [tasks[currentIndex], tasks[newIndex]] = [tasks[newIndex], tasks[currentIndex]];
-                
-                setOwner({
-                    ...owner,
-                    [taskType]: tasks
+                // Use functional setEmployees to get latest state (not stale closure)
+                setEmployees(latestEmployees => {
+                    Storage.saveEmployees(latestEmployees);
+                    if (useFirebase) {
+                        latestEmployees.forEach(emp => {
+                            FirebaseDB.saveEmployee(emp);
+                        });
+                    }
+                    return latestEmployees;
                 });
             };
+            
+
             
             // New handlers for owner dashboard features
             
-            // Filter work history to last 30 days and by date range
+            // Filter work history - by custom date range if set, otherwise last 30 days
             const filterWorkHistory = (workHistory) => {
                 if (!workHistory || workHistory.length === 0) return [];
                 
-                const thirtyDaysAgo = new Date();
-                thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-                
-                let filtered = workHistory.filter(entry => {
-                    const entryDate = new Date(entry.date);
-                    return entryDate >= thirtyDaysAgo;
-                });
-                
-                // Apply date range filter if set (compare date strings only, not timestamps)
+                // If a custom date range is set, use it exclusively (no 30-day cap)
                 if (dateRangeFilter.start || dateRangeFilter.end) {
-                    filtered = filtered.filter(entry => {
-                        const entryDate = new Date(entry.date);
-                        // Get just the date part (YYYY-MM-DD) for comparison
-                        const entryDateStr = entryDate.toISOString().split('T')[0];
-                        
-                        // Check start date
-                        if (dateRangeFilter.start && entryDateStr < dateRangeFilter.start) {
-                            return false;
-                        }
-                        
-                        // Check end date
-                        if (dateRangeFilter.end && entryDateStr > dateRangeFilter.end) {
-                            return false;
-                        }
-                        
+                    return workHistory.filter(entry => {
+                        const entryDateStr = new Date(entry.date).toISOString().split('T')[0];
+                        if (dateRangeFilter.start && entryDateStr < dateRangeFilter.start) return false;
+                        if (dateRangeFilter.end && entryDateStr > dateRangeFilter.end) return false;
                         return true;
                     });
                 }
                 
-                return filtered;
+                // Default: last 30 days
+                const thirtyDaysAgo = new Date();
+                thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+                return workHistory.filter(entry => new Date(entry.date) >= thirtyDaysAgo);
             };
             
             // Update work entry times
@@ -3238,15 +3223,15 @@
                                     
                                     {employees.map(employee => {
                                         const filteredHistory = filterWorkHistory(employee.workHistory || []);
-                                        const totalMinutes = filteredHistory.reduce((sum, entry) => {
+                                        const totalNetMinutes = filteredHistory.reduce((sum, entry) => {
                                             const clockIn = new Date(entry.clockIn);
                                             const clockOut = new Date(entry.clockOut);
-                                            const totalMinutes = (clockOut - clockIn) / (1000 * 60);
-                                            const netMinutes = Math.max(0, totalMinutes - (entry.assignedBreakMinutes || 0));
+                                            const entryMinutes = (clockOut - clockIn) / (1000 * 60);
+                                            const netMinutes = Math.max(0, entryMinutes - (entry.assignedBreakMinutes || 0));
                                             return sum + netMinutes;
                                         }, 0);
-                                        const totalHours = Math.floor(totalMinutes / 60);
-                                        const totalMins = Math.floor(totalMinutes % 60);
+                                        const totalHours = Math.floor(totalNetMinutes / 60);
+                                        const totalMins = Math.floor(totalNetMinutes % 60);
                                         
                                         // Group work history by date
                                         const historyByDate = {};
@@ -5209,7 +5194,6 @@
                                                         <select 
                                                             value={selectedEmployeeToAssign}
                                                             onChange={(e) => {
-                                                                console.log('Employee selected:', e.target.value);
                                                                 setSelectedEmployeeToAssign(e.target.value);
                                                             }}
                                                             className="w-full px-4 py-3 bg-slate-900/50 border border-slate-600 rounded-lg text-white focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
@@ -5253,9 +5237,6 @@
                                                         type="button"
                                                         onClick={(e) => {
                                                             e.preventDefault();
-                                                            console.log('Assign button clicked!');
-                                                            console.log('Selected employee:', selectedEmployeeToAssign);
-                                                            console.log('Task to assign:', taskToAssign);
                                                             handleAssignTaskToEmployee();
                                                         }}
                                                         disabled={!selectedEmployeeToAssign}
