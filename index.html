@@ -1221,6 +1221,7 @@
                         : emp
                 );
                 setEmployees(updatedEmployees);
+                const clockedInEmployee = updatedEmployees.find(e => e.id === currentEmployee.id);
                 setCurrentEmployee({ 
                     ...currentEmployee, 
                     clockedIn: true, 
@@ -1228,6 +1229,9 @@
                     isLateToday: isLate,
                     minutesLate: minutesLate
                 });
+                // Write immediately to Firebase — bypasses the 1500ms debounce so onSnapshot
+                // never races back with stale clockedIn: false and undoes the clock-in.
+                if (useFirebase) FirebaseDB.saveEmployee(clockedInEmployee);
             };
 
             const handleClockOut = () => {
@@ -1282,6 +1286,7 @@
                         : emp
                 );
                 setEmployees(updatedEmployees);
+                const clockedOutEmployee = updatedEmployees.find(e => e.id === currentEmployee.id);
                 setCurrentEmployee({ 
                     ...currentEmployee, 
                     clockedIn: false, 
@@ -1292,6 +1297,10 @@
                     isLateToday: false,
                     minutesLate: 0
                 });
+                // Write immediately to Firebase — bypasses the 1500ms debounce so onSnapshot
+                // never races back with stale clockedIn: true and snaps the employee back to clocked in,
+                // which would also risk a duplicate work history entry on a second clock-out click.
+                if (useFirebase) FirebaseDB.saveEmployee(clockedOutEmployee);
                 setError('');
             };
 
