@@ -8,65 +8,155 @@
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <style>
-        /* ── LIGHT THEME OVERRIDES ── */
-        [data-theme="light"] {
-            --tw-bg-opacity: 1;
+        /* ══════════════════════════════════
+           WORKFLOW THEME SYSTEM
+           Dark = default (Tailwind slate)
+           Light = override via [data-theme="light"]
+        ══════════════════════════════════ */
+
+        /* ── LIGHT MODE: nuclear override on everything ── */
+        [data-theme="light"],
+        [data-theme="light"] * {
+            border-color: #e2e8f0;
         }
-        [data-theme="light"] body {
-            background: #f1f5f9;
+
+        /* Page background */
+        [data-theme="light"] .min-h-screen {
+            background: #f8fafc !important;
+            background-image: none !important;
         }
-        /* Slate-900 backgrounds → white/light */
-        [data-theme="light"] .bg-slate-900,
-        [data-theme="light"] .from-slate-900,
-        [data-theme="light"] .via-slate-800,
-        [data-theme="light"] .to-slate-900 {
-            --tw-gradient-from: #f8fafc;
-            --tw-gradient-via: #f1f5f9;
-            --tw-gradient-to: #f8fafc;
-            background-color: #f8fafc !important;
+        [data-theme="light"] .absolute.inset-0 {
+            display: none !important;
         }
-        [data-theme="light"] .bg-slate-800\/50,
-        [data-theme="light"] .bg-slate-800\/30,
-        [data-theme="light"] .bg-slate-800\/60,
-        [data-theme="light"] .bg-slate-800\/80 {
-            background-color: rgba(255,255,255,0.9) !important;
+
+        /* ── All backgrounds ── */
+        [data-theme="light"] [class*="bg-slate-900"],
+        [data-theme="light"] [class*="bg-slate-800"],
+        [data-theme="light"] [class*="bg-slate-700"],
+        [data-theme="light"] [class*="from-slate-"],
+        [data-theme="light"] [class*="via-slate-"],
+        [data-theme="light"] [class*="to-slate-"] {
+            background-color: #ffffff !important;
+            background-image: none !important;
         }
-        [data-theme="light"] .bg-slate-800 { background-color: #ffffff !important; }
-        [data-theme="light"] .bg-slate-700\/50 { background-color: rgba(203,213,225,0.5) !important; }
-        [data-theme="light"] .bg-slate-700\/20 { background-color: rgba(203,213,225,0.2) !important; }
-        [data-theme="light"] .bg-slate-900\/30,
-        [data-theme="light"] .bg-slate-900\/50,
-        [data-theme="light"] .bg-slate-900\/60 { background-color: rgba(241,245,249,0.8) !important; }
-        /* Text */
-        [data-theme="light"] .text-white { color: #0f172a !important; }
-        [data-theme="light"] .text-slate-300 { color: #334155 !important; }
-        [data-theme="light"] .text-slate-400 { color: #475569 !important; }
-        [data-theme="light"] .text-slate-500 { color: #64748b !important; }
-        /* Borders */
-        [data-theme="light"] .border-slate-700\/50 { border-color: rgba(203,213,225,0.6) !important; }
-        [data-theme="light"] .border-slate-700\/30 { border-color: rgba(203,213,225,0.4) !important; }
-        [data-theme="light"] .border-slate-700\/40 { border-color: rgba(203,213,225,0.5) !important; }
-        [data-theme="light"] .border-slate-600 { border-color: #cbd5e1 !important; }
+
+        /* Cards / panels — slightly off-white */
+        [data-theme="light"] .rounded-xl,
+        [data-theme="light"] .rounded-2xl,
+        [data-theme="light"] .rounded-lg {
+            background-color: #ffffff !important;
+        }
+
         /* Header bar */
-        [data-theme="light"] .backdrop-blur-xl { background-color: rgba(255,255,255,0.95) !important; }
-        [data-theme="light"] .border-slate-700\/50.border-b { border-bottom-color: #e2e8f0 !important; }
-        /* Inputs */
-        [data-theme="light"] input[type="text"],
-        [data-theme="light"] input[type="password"],
-        [data-theme="light"] input[type="number"],
-        [data-theme="light"] input[type="date"],
-        [data-theme="light"] input[type="time"],
+        [data-theme="light"] .backdrop-blur-xl {
+            background-color: rgba(255,255,255,0.97) !important;
+            border-bottom: 1px solid #e2e8f0 !important;
+        }
+
+        /* Sidebar / secondary panels */
+        [data-theme="light"] .bg-slate-800\/30 { background-color: #f8fafc !important; }
+        [data-theme="light"] .bg-slate-800\/50 { background-color: #f1f5f9 !important; }
+        [data-theme="light"] .bg-slate-800\/60 { background-color: #f1f5f9 !important; }
+        [data-theme="light"] .bg-slate-800\/80 { background-color: #ffffff !important; }
+        [data-theme="light"] .bg-slate-700\/20 { background-color: #f1f5f9 !important; }
+        [data-theme="light"] .bg-slate-700\/30 { background-color: #e2e8f0 !important; }
+        [data-theme="light"] .bg-slate-700\/50 { background-color: #e2e8f0 !important; }
+        [data-theme="light"] .bg-slate-900\/30 { background-color: #f8fafc !important; }
+        [data-theme="light"] .bg-slate-900\/40 { background-color: #f1f5f9 !important; }
+        [data-theme="light"] .bg-slate-900\/50 { background-color: #f1f5f9 !important; }
+        [data-theme="light"] .bg-slate-900\/60 { background-color: #e9eef5 !important; }
+        [data-theme="light"] .bg-slate-600    { background-color: #94a3b8 !important; }
+
+        /* ── ALL TEXT ── */
+        [data-theme="light"] .text-white      { color: #0f172a !important; }
+        [data-theme="light"] .text-slate-100  { color: #1e293b !important; }
+        [data-theme="light"] .text-slate-200  { color: #1e293b !important; }
+        [data-theme="light"] .text-slate-300  { color: #334155 !important; }
+        [data-theme="light"] .text-slate-400  { color: #475569 !important; }
+        [data-theme="light"] .text-slate-500  { color: #64748b !important; }
+        [data-theme="light"] .text-slate-600  { color: #475569 !important; }
+
+        /* ── BORDERS ── */
+        [data-theme="light"] [class*="border-slate"] {
+            border-color: #e2e8f0 !important;
+        }
+        [data-theme="light"] [class*="divide-slate"] > * + * {
+            border-color: #e2e8f0 !important;
+        }
+
+        /* ── INPUTS & SELECTS ── */
+        [data-theme="light"] input,
         [data-theme="light"] select,
         [data-theme="light"] textarea {
             background-color: #ffffff !important;
             color: #0f172a !important;
             border-color: #cbd5e1 !important;
         }
-        /* Divide lines */
-        [data-theme="light"] .divide-slate-700\/30 > * + * { border-color: rgba(203,213,225,0.4) !important; }
-        /* Clock card */
-        [data-theme="light"] .border-green-500\/25 { border-color: rgba(34,197,94,0.4) !important; }
-        [data-theme="light"] .bg-green-600\/15 { background-color: rgba(34,197,94,0.1) !important; }
+        [data-theme="light"] input::placeholder { color: #94a3b8 !important; }
+
+        /* ── NAV TABS ── */
+        [data-theme="light"] .bg-slate-700    { background-color: #e2e8f0 !important; }
+        [data-theme="light"] button:not([class*="bg-gradient"]):not([class*="bg-green"]):not([class*="bg-red"]):not([class*="bg-blue"]):not([class*="bg-amber"]):not([class*="bg-violet"]):not([class*="bg-orange"]) {
+            color: #334155;
+        }
+
+        /* ── HOVER STATES ── */
+        [data-theme="light"] .hover\:bg-slate-700:hover { background-color: #cbd5e1 !important; }
+        [data-theme="light"] .hover\:bg-slate-700\/20:hover { background-color: #f1f5f9 !important; }
+
+        /* ── FONT-MONO stays readable ── */
+        [data-theme="light"] .font-mono { color: #0f172a !important; }
+
+        /* ── CLOCK CARD ── */
+        [data-theme="light"] .border-green-500\/25 { border-color: rgba(34,197,94,0.5) !important; }
+        [data-theme="light"] .bg-green-900\/20     { background-color: #f0fdf4 !important; }
+        [data-theme="light"] .bg-green-600\/15     { background-color: rgba(34,197,94,0.08) !important; }
+
+        /* ── ALERTS ── */
+        [data-theme="light"] .bg-red-500\/10    { background-color: #fef2f2 !important; }
+        [data-theme="light"] .bg-amber-500\/10  { background-color: #fffbeb !important; }
+        [data-theme="light"] .bg-blue-500\/10   { background-color: #eff6ff !important; }
+        [data-theme="light"] .bg-green-500\/10  { background-color: #f0fdf4 !important; }
+
+        /* ── SHADOWS ── */
+        [data-theme="light"] .shadow-xl,
+        [data-theme="light"] .shadow-lg,
+        [data-theme="light"] .shadow-2xl {
+            box-shadow: 0 4px 24px rgba(0,0,0,0.08) !important;
+        }
+
+        /* ── EMPLOYEE TASK CARDS ── */
+        [data-theme="light"] .bg-blue-600\/20  { background-color: #eff6ff !important; }
+        [data-theme="light"] .bg-blue-900\/20  { background-color: #eff6ff !important; }
+        [data-theme="light"] .bg-violet-600\/20 { background-color: #f5f3ff !important; }
+        [data-theme="light"] .bg-red-600\/20   { background-color: #fef2f2 !important; }
+
+        /* ── SCROLLBAR (light) ── */
+        [data-theme="light"] ::-webkit-scrollbar { width: 6px; }
+        [data-theme="light"] ::-webkit-scrollbar-track { background: #f1f5f9; }
+        [data-theme="light"] ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+
+        /* ── THEME TOGGLE BUTTON ── */
+        .theme-toggle-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s;
+            background: rgba(100,116,139,0.2);
+            color: #94a3b8;
+            flex-shrink: 0;
+        }
+        .theme-toggle-btn:hover { background: rgba(100,116,139,0.35); }
+        [data-theme="light"] .theme-toggle-btn {
+            background: #e2e8f0;
+            color: #475569;
+        }
+        [data-theme="light"] .theme-toggle-btn:hover { background: #cbd5e1; }
     </style>
     <script src="https://cdn.tailwindcss.com"></script>
     
@@ -706,7 +796,6 @@
 
             const [clockTick, setClockTick] = useState(0);
             const [attendanceView, setAttendanceView] = useState('live');
-            const [attendanceHistoryEmp, setAttendanceHistoryEmp] = useState(null);
             const [editingSession, setEditingSession] = useState(null); // {empId, entryId}
             const [editSessionForm, setEditSessionForm] = useState({});
             const [historyDateFrom, setHistoryDateFrom] = useState(() => {
@@ -2890,7 +2979,7 @@
                                     {/* Theme toggle */}
                                     <button
                                         onClick={() => setDarkMode(d => !d)}
-                                        className="flex items-center justify-center w-9 h-9 bg-slate-700/50 hover:bg-slate-700 text-slate-300 rounded-lg transition-all"
+                                        className="theme-toggle-btn"
                                         title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
                                     >
                                         {darkMode ? (
@@ -3007,28 +3096,7 @@
                                 };
 
                                 // Live stats
-                                const inNow = employees.filter(e => e.clockedIn);
-                                const notIn = employees.filter(e => !e.clockedIn && e.schedule?.openingTime);
-                                const lateOrMissing = notIn.filter(e => {
-                                    const tz = e.schedule?.timezone || 'America/Toronto';
-                                    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-                                    const [oh, om] = e.schedule.openingTime.split(':').map(Number);
-                                    const shiftStart = new Date(`${todayStr}T${String(oh).padStart(2,'0')}:${String(om).padStart(2,'0')}:00`);
-                                    const tzOff = new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
-                                    const startUTC = new Date(shiftStart.getTime() - tzOff);
-                                    return now > startUTC;
-                                });
 
-                                // Weekly totals
-                                const weekStart = new Date(now);
-                                weekStart.setDate(now.getDate() - now.getDay());
-                                weekStart.setHours(0,0,0,0);
-                                const hourlyEmployees = employees.filter(e => e.isHourly);
-                                const weeklyTotals = hourlyEmployees.map(emp => {
-                                    const entries = (emp.workHistory || []).filter(e => new Date(e.date) >= weekStart);
-                                    const mins = entries.reduce((s,e) => s + (e.paidMinutes || 0), 0);
-                                    return { emp, mins, entries: entries.length };
-                                });
 
                                 return (
                                     <div className="space-y-6">
@@ -3050,63 +3118,23 @@
                                         </div>
 
                                         {attendanceView === 'live' && (
-                                            <div className="space-y-4">
+                                             <div className="space-y-2">
 
-                                                {/* Summary stats */}
-                                                <div className="grid grid-cols-3 gap-4">
-                                                    <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 text-center">
-                                                        <div className="text-2xl font-bold text-green-400">{inNow.length}</div>
-                                                        <div className="text-xs text-slate-400 mt-1">Clocked in</div>
-                                                    </div>
-                                                    <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 text-center">
-                                                        <div className="text-2xl font-bold text-red-400">{lateOrMissing.length}</div>
-                                                        <div className="text-xs text-slate-400 mt-1">Missing / late</div>
-                                                    </div>
-                                                    <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-4 text-center">
-                                                        <div className="text-2xl font-bold text-slate-300">{employees.length}</div>
-                                                        <div className="text-xs text-slate-400 mt-1">Total employees</div>
-                                                    </div>
-                                                </div>
-
-                                                {/* Missing alert */}
-                                                {lateOrMissing.length > 0 && (
-                                                    <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 flex items-start gap-3">
-                                                        <svg className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01" strokeWidth="2" strokeLinecap="round"/></svg>
-                                                        <div>
-                                                            <p className="text-red-400 font-semibold text-sm">
-                                                                {lateOrMissing.map(e => e.name).join(', ')} {lateOrMissing.length === 1 ? 'has' : 'have'} not clocked in
-                                                            </p>
-                                                            <p className="text-red-300/70 text-xs mt-1">Email alert sent to owner after 5 min grace period</p>
-                                                        </div>
-                                                    </div>
-                                                )}
-
-                                                {/* Employee rows */}
+                                                {/* Employee list */}
                                                 <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-slate-700/50 overflow-hidden">
                                                     <div className="p-4 border-b border-slate-700/50">
                                                         <h3 className="text-white font-bold text-lg">All employees — today</h3>
                                                     </div>
                                                     <div className="divide-y divide-slate-700/30">
                                                         {employees.map(emp => {
-                                                            const tz = emp.schedule?.timezone || 'America/Toronto';
-                                                            const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-                                                            let shiftStartUTC = null;
-                                                            if (emp.schedule?.openingTime) {
-                                                                const [oh, om] = emp.schedule?.openingTime.split(':').map(Number);
-                                                                const shiftStart = new Date(`${todayStr}T${String(oh).padStart(2,'0')}:${String(om).padStart(2,'0')}:00`);
-                                                                const tzOff = new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
-                                                                shiftStartUTC = new Date(shiftStart.getTime() - tzOff);
-                                                            }
-                                                            const isMissing = !emp.clockedIn && shiftStartUTC && now > shiftStartUTC;
-                                                            const minsLate = emp.clockedIn && shiftStartUTC
-                                                                ? Math.max(0, Math.round((new Date(emp.clockInTime) - shiftStartUTC) / 60000))
-                                                                : 0;
-                                                            const liveElapsed = emp.clockedIn ? elapsed(emp.clockInTime) : null;
-                                                            const livePaidMin = emp.clockedIn
-                                                                ? Math.max(0, (now - new Date(emp.clockInTime)) / 60000 - (emp.assignedBreakMinutes || 0))
-                                                                : 0;
-                                                            const liveEarned = ((livePaidMin / 60) * (emp.hourlyRate || 0)).toFixed(2);
-
+                                                            const fmtClockIn = (iso) => {
+                                                                if (!iso) return null;
+                                                                const d = new Date(iso);
+                                                                const h = d.getHours();
+                                                                const m = String(d.getMinutes()).padStart(2,'0');
+                                                                const ampm = h >= 12 ? 'PM' : 'AM';
+                                                                return `${h % 12 || 12}:${m} ${ampm}`;
+                                                            };
                                                             return (
                                                                 <div key={emp.id} className="flex items-center gap-4 px-5 py-4">
                                                                     <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center text-white text-sm font-bold flex-shrink-0">
@@ -3115,21 +3143,11 @@
                                                                     <div className="flex-1 min-w-0">
                                                                         <div className="text-white font-semibold text-sm">{emp.name}</div>
                                                                         <div className="text-slate-400 text-xs mt-0.5">
-                                                                            {emp.schedule?.openingTime || '?'} – {emp.schedule?.closingTime || '?'} · ${(emp.hourlyRate || 0).toFixed(2)}/hr
+                                                                            {emp.clockedIn
+                                                                                ? <span className="text-green-400 font-medium">Clocked in at {fmtClockIn(emp.clockInTime)}</span>
+                                                                                : <span className="text-slate-500">Not clocked in</span>
+                                                                            }
                                                                         </div>
-                                                                    </div>
-                                                                    <div className="text-center min-w-[90px]">
-                                                                        {emp.clockedIn ? (
-                                                                            <>
-                                                                                <div className="text-green-400 text-xs font-semibold">In since {fmtTime(emp.clockInTime)}</div>
-                                                                                <div className="text-slate-300 text-xs">{liveElapsed} · ${liveEarned}</div>
-                                                                                {minsLate > 0 && <div className="text-amber-400 text-xs">{minsLate}m late</div>}
-                                                                            </>
-                                                                        ) : isMissing ? (
-                                                                            <div className="text-red-400 text-xs font-semibold">No clock-in</div>
-                                                                        ) : (
-                                                                            <div className="text-slate-500 text-xs">Shift not started</div>
-                                                                        )}
                                                                     </div>
                                                                     <div className="flex items-center gap-2 flex-shrink-0">
                                                                         {emp.clockedIn ? (
@@ -3143,10 +3161,8 @@
                                                                                     Clock Out
                                                                                 </button>
                                                                             </>
-                                                                        ) : isMissing ? (
-                                                                            <span className="px-3 py-1 bg-red-500/20 text-red-400 rounded-full text-xs font-semibold">Missing</span>
                                                                         ) : (
-                                                                            <span className="px-3 py-1 bg-slate-700/50 text-slate-400 rounded-full text-xs">Not started</span>
+                                                                            <span className="px-3 py-1 bg-slate-700/50 text-slate-400 rounded-full text-xs">Not clocked in</span>
                                                                         )}
                                                                     </div>
                                                                 </div>
@@ -3154,14 +3170,16 @@
                                                         })}
                                                     </div>
                                                 </div>
-                                            </div>
+                                             </div>
                                         )}
+
 
                                         {attendanceView === 'history' && (() => {
                                             // Range filter
                                             const rangeFrom = historyDateFrom ? new Date(historyDateFrom + 'T00:00:00') : new Date(0);
                                             const rangeTo   = historyDateTo   ? new Date(historyDateTo   + 'T23:59:59') : new Date();
 
+                                            const hourlyEmployees = employees.filter(e => e.isHourly);
                                             const filteredTotals = hourlyEmployees.map(emp => {
                                                 const entries = (emp.workHistory || [])
                                                     .filter(e => { const d = new Date(e.date); return d >= rangeFrom && d <= rangeTo; })
@@ -5255,7 +5273,7 @@ if (currentView === 'employeeDashboard') {
                                     {/* Theme toggle */}
                                     <button
                                         onClick={() => setDarkMode(d => !d)}
-                                        className="flex items-center justify-center w-9 h-9 bg-slate-700/50 hover:bg-slate-700 text-slate-300 rounded-lg transition-all"
+                                        className="theme-toggle-btn"
                                         title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
                                     >
                                         {darkMode ? (
@@ -5398,7 +5416,7 @@ if (currentView === 'employeeDashboard') {
                                                     {emp.assignedBreakMinutes > 0 && (
                                                         <span>{emp.assignedBreakMinutes}m break deducted from paid hours · </span>
                                                     )}
-                                                    Auto clock-out at {emp.schedule?.closingTime ? fmt12(emp.schedule.closingTime) : 'closing time'}
+                                                    Auto clock-out at {emp.schedule?.closingTime ? fmt12(emp.schedule?.closingTime) : 'closing time'}
                                                 </div>
                                             </div>
 
