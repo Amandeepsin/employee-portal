@@ -1778,6 +1778,7 @@
             const recalcEntry = (form) => {
                 const clockIn = new Date(form.clockInDate + 'T' + form.clockInTime);
                 const clockOut = new Date(form.clockOutDate + 'T' + form.clockOutTime);
+                if (isNaN(clockIn) || isNaN(clockOut)) return { grossMin: 0, paidMin: 0, paidHours: 0, pay: 0 };
                 const grossMin = Math.max(0, (clockOut - clockIn) / 60000);
                 const breakMin = parseInt(form.breakMinutes) || 0;
                 const paidMin = Math.max(0, grossMin - breakMin);
@@ -1811,6 +1812,7 @@
                         ...emp,
                         workHistory: (emp.workHistory || []).map(e => e.id !== entryId ? e : {
                             ...e,
+                            date: new Date(f.clockInDate + 'T' + f.clockInTime).toISOString(),
                             clockIn: new Date(f.clockInDate + 'T' + f.clockInTime).toISOString(),
                             clockOut: new Date(f.clockOutDate + 'T' + f.clockOutTime).toISOString(),
                             breakMinutes: parseInt(f.breakMinutes) || 0,
@@ -1824,6 +1826,11 @@
                     };
                 });
                 setEmployees(updatedEmployees);
+                // Keep currentEmployee in sync if it's the same employee
+                if (currentEmployee?.id === empId) {
+                    const updatedEmp = updatedEmployees.find(e => e.id === empId);
+                    if (updatedEmp) setCurrentEmployee(updatedEmp);
+                }
                 if (useFirebase) {
                     const emp = updatedEmployees.find(e => e.id === empId);
                     if (emp) FirebaseDB.saveEmployee(emp);
@@ -1839,6 +1846,10 @@
                     return { ...emp, workHistory: (emp.workHistory || []).filter(e => e.id !== entryId) };
                 });
                 setEmployees(updatedEmployees);
+                if (currentEmployee?.id === empId) {
+                    const updatedEmp = updatedEmployees.find(e => e.id === empId);
+                    if (updatedEmp) setCurrentEmployee(updatedEmp);
+                }
                 if (useFirebase) {
                     const emp = updatedEmployees.find(e => e.id === empId);
                     if (emp) FirebaseDB.saveEmployee(emp);
@@ -1881,6 +1892,10 @@
                         : e
                 );
                 setEmployees(updatedEmployees);
+                if (currentEmployee?.id === empId) {
+                    const updatedEmp = updatedEmployees.find(e => e.id === empId);
+                    if (updatedEmp) setCurrentEmployee(updatedEmp);
+                }
                 if (useFirebase) {
                     const emp = updatedEmployees.find(e => e.id === empId);
                     if (emp) FirebaseDB.saveEmployee(emp);
@@ -2135,6 +2150,8 @@
                         assignedBreakMinutes: 30,
                         isHourly: newEmployee.isHourly || false,
                         clockInAlert: newEmployee.clockInAlert || false,
+                        breakStartTime: '',
+                        breakEndTime: '',
                         hourlyRate: newEmployee.isHourly ? (parseFloat(newEmployee.hourlyRate) || 0) : 0,
                         clockedIn: false,
                         clockInTime: null,
@@ -2188,6 +2205,11 @@
                     }
                 }
                 
+                // Keep currentEmployee in sync if it's the employee being edited
+                if (currentEmployee?.id === employeeId) {
+                    const updated = updatedEmployees.find(e => e.id === employeeId);
+                    if (updated) setCurrentEmployee(updated);
+                }
                 setEditingEmployee(null);
                 setEditFormData({}); // Clear form data
             };
