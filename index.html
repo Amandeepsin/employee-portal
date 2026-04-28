@@ -136,6 +136,161 @@
         [data-theme="light"] ::-webkit-scrollbar-track { background: #f1f5f9; }
         [data-theme="light"] ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
 
+        /* ══════════════════════════════════
+           MOBILE RESPONSIVE — iPhone optimised
+           Breakpoint: 640px (sm)
+        ══════════════════════════════════ */
+
+        /* Base overflow protection */
+        * { box-sizing: border-box; }
+        body { overflow-x: hidden; }
+
+        /* ── MOBILE ONLY (max 640px) ── */
+        @media (max-width: 640px) {
+
+            /* Content padding */
+            .max-w-7xl.mx-auto,
+            .max-w-5xl.mx-auto,
+            .max-w-4xl.mx-auto {
+                padding-left: 12px !important;
+                padding-right: 12px !important;
+            }
+
+            /* ── HEADER BARS ── */
+            /* Owner header: stack logo and buttons */
+            .wf-owner-header { flex-wrap: wrap; gap: 8px !important; }
+            .wf-owner-header .wf-header-right { gap: 6px !important; }
+            .wf-owner-header .wf-header-right button,
+            .wf-owner-header .wf-header-right a {
+                padding: 6px 10px !important;
+                font-size: 12px !important;
+            }
+
+            /* Employee header */
+            .wf-emp-header { flex-wrap: wrap; gap: 6px !important; }
+
+            /* ── NAV TABS ── */
+            .wf-nav-tabs {
+                display: flex !important;
+                flex-wrap: wrap !important;
+                gap: 6px !important;
+                padding: 0 !important;
+            }
+            .wf-nav-tabs button {
+                flex: 1 1 auto !important;
+                min-width: 120px !important;
+                padding: 8px 10px !important;
+                font-size: 12px !important;
+                text-align: center !important;
+            }
+
+            /* ── GRIDS ── */
+            /* All unresponsive grids collapse to 1 col */
+            .grid.grid-cols-3,
+            .grid.grid-cols-4,
+            .grid.grid-cols-6 {
+                grid-template-columns: 1fr 1fr !important;
+            }
+            .grid.grid-cols-2 {
+                grid-template-columns: 1fr 1fr !important;
+            }
+
+            /* Edit form: schedule fields go 2-col */
+            .wf-schedule-grid {
+                grid-template-columns: 1fr 1fr !important;
+            }
+
+            /* ── SIDEBAR LAYOUT ── */
+            /* Manage employees: sidebar + detail stack vertically */
+            .wf-sidebar-layout {
+                grid-template-columns: 1fr !important;
+            }
+            .wf-sidebar { min-width: 0 !important; }
+            .wf-detail-panel { min-width: 0 !important; }
+
+            /* ── TABLES ── */
+            /* Work history table: horizontal scroll */
+            .wf-table-wrap {
+                overflow-x: auto !important;
+                -webkit-overflow-scrolling: touch !important;
+            }
+            .wf-table-wrap table {
+                min-width: 520px !important;
+            }
+
+            /* ── CLOCK CARD ── */
+            .wf-clock-card-stats {
+                grid-template-columns: 1fr !important;
+            }
+            .wf-clock-card-stats > div {
+                border-right: none !important;
+                border-bottom: 0.5px solid rgba(100,116,139,0.3) !important;
+            }
+            .wf-clock-card-stats > div:last-child {
+                border-bottom: none !important;
+            }
+
+            /* ── BUTTONS ── */
+            /* Make stacked button rows wrap */
+            .wf-btn-row {
+                flex-wrap: wrap !important;
+                gap: 6px !important;
+            }
+            .wf-btn-row button,
+            .wf-btn-row a {
+                flex: 1 1 auto !important;
+                min-width: 0 !important;
+                justify-content: center !important;
+            }
+
+            /* ── EMPLOYEE LIST ROW ── */
+            /* Live today row: stack info and badge */
+            .wf-live-row {
+                flex-wrap: wrap !important;
+                gap: 6px !important;
+            }
+
+            /* ── ATTENDANCE HISTORY ── */
+            /* Per-employee header: stack name and buttons */
+            .wf-emp-hist-header {
+                flex-wrap: wrap !important;
+                gap: 8px !important;
+            }
+            .wf-emp-hist-header .wf-hist-actions {
+                flex-wrap: wrap !important;
+                gap: 6px !important;
+            }
+
+            /* ── FORMS ── */
+            /* Add employee form inputs: full width */
+            .wf-add-emp-form {
+                grid-template-columns: 1fr !important;
+            }
+
+            /* ── FONT SIZES ── */
+            h1 { font-size: 20px !important; }
+            .text-3xl { font-size: 22px !important; }
+            .text-2xl { font-size: 18px !important; }
+            .text-xl  { font-size: 16px !important; }
+
+            /* ── OVERFLOW PROTECTION ── */
+            .overflow-x-auto { -webkit-overflow-scrolling: touch; }
+
+            /* ── MODAL / OVERLAYS ── */
+            .wf-modal {
+                margin: 8px !important;
+                max-height: 90vh !important;
+                overflow-y: auto !important;
+            }
+        }
+
+        @media (max-width: 380px) {
+            .grid.grid-cols-2,
+            .grid.grid-cols-3 {
+                grid-template-columns: 1fr !important;
+            }
+        }
+
         /* ── THEME TOGGLE BUTTON ── */
         .theme-toggle-btn {
             display: flex;
@@ -837,9 +992,63 @@
                     if (session && session.type === 'employee') {
                         const employee = employees.find(emp => emp.id === session.data.id);
                         if (employee) {
-                            // AUTO CLOCK-IN on session restore (same as login)
+                            // RETROACTIVE CLOCK-OUT — if employee is still marked clocked in
+                            // but it's past their closing time (or a new day), close the session
                             let restoredEmployee = employee;
-                            if (!employee.clockedIn) {
+                            if (employee.clockedIn && employee.clockInTime) {
+                                const now = new Date();
+                                const clockInDate = new Date(employee.clockInTime);
+                                const tz = employee.schedule?.timezone || 'America/Toronto';
+                                const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
+                                const clockInDay = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(clockInDate);
+                                const isDifferentDay = todayStr !== clockInDay;
+
+                                // Determine scheduled closing time
+                                let closingUTC = null;
+                                if (employee.schedule?.closingTime) {
+                                    const [ch, cm] = employee.schedule.closingTime.split(':').map(Number);
+                                    const closingLocal = new Date(`${clockInDay}T${String(ch).padStart(2,'0')}:${String(cm).padStart(2,'0')}:00`);
+                                    const tzOff = new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
+                                    closingUTC = new Date(closingLocal.getTime() - tzOff);
+                                }
+
+                                const isPastClosing = closingUTC && now > closingUTC;
+
+                                if (isDifferentDay || isPastClosing) {
+                                    // Clock out at scheduled closing time (or clock-in time + 8h if no schedule)
+                                    const clockOutTime = closingUTC || new Date(clockInDate.getTime() + 8 * 3600000);
+                                    const breakMin = employee.assignedBreakMinutes || 0;
+                                    const grossMin = (clockOutTime - clockInDate) / 60000;
+                                    const paidMin = Math.max(0, grossMin - breakMin);
+                                    const paidHours = parseFloat((paidMin / 60).toFixed(2));
+                                    const rate = employee.hourlyRate || 0;
+                                    const pay = parseFloat((paidHours * rate).toFixed(2));
+                                    const entry = {
+                                        id: Date.now(),
+                                        date: clockOutTime.toISOString(),
+                                        clockIn: employee.clockInTime,
+                                        clockOut: clockOutTime.toISOString(),
+                                        grossMinutes: Math.round(grossMin),
+                                        breakMinutes: breakMin,
+                                        paidMinutes: Math.round(paidMin),
+                                        paidHours, hourlyRate: rate, pay,
+                                        autoClockOut: true,
+                                        missedClockOut: true
+                                    };
+                                    restoredEmployee = {
+                                        ...employee,
+                                        clockedIn: false,
+                                        clockOutTime: clockOutTime.toISOString(),
+                                        workHistory: [...(employee.workHistory || []), entry],
+                                        isLateToday: false,
+                                        minutesLate: 0
+                                    };
+                                    if (useFirebase) FirebaseDB.saveEmployee(restoredEmployee);
+                                }
+                            }
+
+                            // AUTO CLOCK-IN on session restore (same as login)
+                            if (!restoredEmployee.clockedIn) {
                                 const now = new Date();
                                 const tz = employee.schedule?.timezone || 'America/Toronto';
                                 const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
@@ -1036,6 +1245,52 @@
                 const interval = setInterval(() => setClockTick(t => t + 1), 1000);
                 return () => clearInterval(interval);
             }, []);
+
+            // Warn employee if they try to close tab while clocked in
+            useEffect(() => {
+                const handleBeforeUnload = (e) => {
+                    if (currentView === 'employeeDashboard' && currentEmployee?.clockedIn) {
+                        // Attempt silent clock-out before tab closes
+                        const now = new Date();
+                        const breakMin = currentEmployee.assignedBreakMinutes || 0;
+                        const grossMin = (now - new Date(currentEmployee.clockInTime)) / 60000;
+                        const paidMin = Math.max(0, grossMin - breakMin);
+                        const paidHours = parseFloat((paidMin / 60).toFixed(2));
+                        const rate = currentEmployee.hourlyRate || 0;
+                        const pay = parseFloat((paidHours * rate).toFixed(2));
+                        const entry = {
+                            id: Date.now(),
+                            date: now.toISOString(),
+                            clockIn: currentEmployee.clockInTime,
+                            clockOut: now.toISOString(),
+                            grossMinutes: Math.round(grossMin),
+                            breakMinutes: breakMin,
+                            paidMinutes: Math.round(paidMin),
+                            paidHours, hourlyRate: rate, pay,
+                            wasLate: currentEmployee.isLateToday || false,
+                            minutesLate: currentEmployee.minutesLate || 0,
+                            autoClockOut: true,
+                            closedTab: true
+                        };
+                        const updated = {
+                            ...currentEmployee,
+                            clockedIn: false,
+                            clockOutTime: now.toISOString(),
+                            workHistory: [...(currentEmployee.workHistory || []), entry],
+                        };
+                        // Use sendBeacon for reliable fire-and-forget on tab close
+                        if (useFirebase) {
+                            try { FirebaseDB.saveEmployee(updated); } catch(e) {}
+                        }
+                        // Show browser warning as backup
+                        e.preventDefault();
+                        e.returnValue = 'You are still clocked in. Please click "End Shift & Sign Out" before leaving.';
+                        return e.returnValue;
+                    }
+                };
+                window.addEventListener('beforeunload', handleBeforeUnload);
+                return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+            }, [currentView, currentEmployee, employees]);
 
             // Auto clock-out + late alert checker — runs every 60s on owner dashboard
             useEffect(() => {
@@ -2766,7 +3021,7 @@
                                                     />
                                                 </div>
                                                 
-                                                <div className="flex gap-3">
+                                                <div className="flex gap-3 wf-btn-row">
                                                     <button
                                                         type="button"
                                                         onClick={handleCancelReset}
@@ -2964,7 +3219,7 @@
                         <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(120,119,198,0.1),transparent)]"></div>
                         
                         <div className="relative border-b border-slate-700/50 bg-slate-800/30 backdrop-blur-xl">
-                            <div className="max-w-7xl mx-auto px-6 py-4">
+                            <div className="max-w-7xl mx-auto px-6 py-4 wf-owner-header">
                                 <div className="flex justify-between items-center mb-4">
                                     <div>
                                         <h1 className="text-3xl font-bold text-white" style={{ fontFamily: 'Georgia, serif' }}>WorkFlow</h1>
@@ -3127,27 +3382,47 @@
                                                     </div>
                                                     <div className="divide-y divide-slate-700/30">
                                                         {employees.map(emp => {
-                                                            const fmtClockIn = (iso) => {
-                                                                if (!iso) return null;
+                                                            void clockTick; // drives 1s re-render for live elapsed
+                                                            const now = new Date();
+                                                            const fmtDate = (iso) => {
+                                                                if (!iso) return '';
+                                                                return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+                                                            };
+                                                            const fmtTime = (iso) => {
+                                                                if (!iso) return '';
                                                                 const d = new Date(iso);
                                                                 const h = d.getHours();
                                                                 const m = String(d.getMinutes()).padStart(2,'0');
                                                                 const ampm = h >= 12 ? 'PM' : 'AM';
                                                                 return `${h % 12 || 12}:${m} ${ampm}`;
                                                             };
+                                                            const fmtElapsed = (iso) => {
+                                                                if (!iso) return '';
+                                                                const mins = Math.floor((now - new Date(iso)) / 60000);
+                                                                const h = Math.floor(mins / 60);
+                                                                const m = mins % 60;
+                                                                return h > 0 ? `${h}h ${m}m` : `${m}m`;
+                                                            };
                                                             return (
-                                                                <div key={emp.id} className="flex items-center gap-4 px-5 py-4">
+                                                                <div key={emp.id} className="flex items-center gap-4 px-5 py-4 wf-live-row">
                                                                     <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center text-white text-sm font-bold flex-shrink-0">
                                                                         {emp.name.charAt(0).toUpperCase()}
                                                                     </div>
                                                                     <div className="flex-1 min-w-0">
                                                                         <div className="text-white font-semibold text-sm">{emp.name}</div>
-                                                                        <div className="text-slate-400 text-xs mt-0.5">
-                                                                            {emp.clockedIn
-                                                                                ? <span className="text-green-400 font-medium">Clocked in at {fmtClockIn(emp.clockInTime)}</span>
-                                                                                : <span className="text-slate-500">Not clocked in</span>
-                                                                            }
-                                                                        </div>
+                                                                        {emp.clockedIn ? (
+                                                                            <div className="flex items-center gap-3 mt-0.5 flex-wrap">
+                                                                                <span className="text-green-400 text-xs font-medium">
+                                                                                    {fmtDate(emp.clockInTime)} · {fmtTime(emp.clockInTime)}
+                                                                                </span>
+                                                                                <span className="text-slate-500 text-xs">·</span>
+                                                                                <span className="text-amber-400 text-xs font-medium font-mono">
+                                                                                    {fmtElapsed(emp.clockInTime)} elapsed
+                                                                                </span>
+                                                                            </div>
+                                                                        ) : (
+                                                                            <div className="text-slate-500 text-xs mt-0.5">Not clocked in</div>
+                                                                        )}
                                                                     </div>
                                                                     <div className="flex items-center gap-2 flex-shrink-0">
                                                                         {emp.clockedIn ? (
@@ -3228,7 +3503,7 @@
                                                     </div>
 
                                                     {/* Grand totals strip */}
-                                                    <div className="grid grid-cols-2 gap-3">
+                                                    <div className="grid grid-cols-2 gap-3 wf-add-emp-form">
                                                         <div className="bg-slate-800/60 rounded-xl border border-slate-700/40 p-4">
                                                             <div className="text-xs text-slate-400 uppercase tracking-wider mb-1">Total Hours</div>
                                                             <div className="text-2xl font-bold text-white">{fmtDuration(grandMins)}</div>
@@ -3244,7 +3519,7 @@
                                                         <div key={emp.id} className="bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-slate-700/50 overflow-hidden">
 
                                                             {/* Employee header */}
-                                                            <div className="flex items-center gap-4 px-5 py-4 border-b border-slate-700/50 bg-slate-800/80">
+                                                            <div className="flex items-center gap-4 px-5 py-4 border-b border-slate-700/50 bg-slate-800/80 wf-emp-hist-header">
                                                                 <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
                                                                     {emp.name.charAt(0).toUpperCase()}
                                                                 </div>
@@ -3481,7 +3756,7 @@
                             </div>
 
             {/* Sidebar + Detail Layout */}
-            <div className="grid md:grid-cols-4 gap-6">
+            <div className="grid md:grid-cols-4 gap-6 wf-sidebar-layout">
                 {/* LEFT SIDEBAR - Employee List */}
                 <div className="md:col-span-1">
                     <h3 className="text-lg font-bold text-white mb-4">Employees</h3>
@@ -3685,7 +3960,7 @@
                                                                     <label className="text-slate-300 text-xs font-semibold mb-2 block">
                                                                         Work Schedule
                                                                     </label>
-                                                                    <div className="grid grid-cols-3 md:grid-cols-6 gap-3">
+                                                                    <div className="grid grid-cols-3 md:grid-cols-6 gap-3 wf-schedule-grid">
                                                                         <div>
                                                                             <label className="text-slate-400 text-xs mb-1 block">Opening Time</label>
                                                                             <input
@@ -5264,7 +5539,7 @@ if (currentView === 'employeeDashboard') {
                         <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(120,119,198,0.1),transparent)]"></div>
                         
                         <div className="relative border-b border-slate-700/50 bg-slate-800/30 backdrop-blur-xl">
-                            <div className="max-w-5xl mx-auto px-6 py-4 flex justify-between items-center">
+                            <div className="max-w-5xl mx-auto px-6 py-4 flex justify-between items-center wf-emp-header">
                                 <div>
                                     <h1 className="text-3xl font-bold text-white" style={{ fontFamily: 'Georgia, serif' }}>WorkFlow</h1>
                                     <p className="text-slate-400 text-sm">Welcome, {currentEmployee.name}</p>
@@ -5390,7 +5665,7 @@ if (currentView === 'employeeDashboard') {
                                             </div>
 
                                             {/* Stats row */}
-                                            <div className="grid grid-cols-2 divide-x divide-slate-700/50 border-b border-slate-700/40">
+                                            <div className="grid grid-cols-2 divide-x divide-slate-700/50 border-b border-slate-700/40 wf-clock-card-stats">
                                                 <div className="px-5 py-4">
                                                     <div className="text-slate-400 text-xs uppercase tracking-wider mb-1">Clocked In</div>
                                                     <div className="text-white text-xl font-bold">{fmtT(emp.clockInTime)}</div>
