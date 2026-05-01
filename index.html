@@ -949,6 +949,7 @@
                 localStorage.setItem('wf_theme', darkMode ? 'dark' : 'light');
             }, [darkMode]);
 
+            const [employeeView, setEmployeeView] = useState('dashboard');
             const [clockTick, setClockTick] = useState(0);
             const [attendanceView, setAttendanceView] = useState('live');
             const [editingSession, setEditingSession] = useState(null); // {empId, entryId}
@@ -992,8 +993,8 @@
                     if (session && session.type === 'employee') {
                         const employee = employees.find(emp => emp.id === session.data.id);
                         if (employee) {
-                            // RETROACTIVE CLOCK-OUT — if employee is still marked clocked in
-                            // but it's past their closing time (or a new day), close the session
+                            // RETROACTIVE CLOCK-OUT — ONLY if clocked in from a PREVIOUS calendar day
+                            // Never fire for same-day sessions — employee may still be working
                             let restoredEmployee = employee;
                             if (employee.clockedIn && employee.clockInTime) {
                                 const now = new Date();
@@ -1003,22 +1004,20 @@
                                 const clockInDay = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(clockInDate);
                                 const isDifferentDay = todayStr !== clockInDay;
 
-                                // Determine scheduled closing time
-                                let closingUTC = null;
-                                if (employee.schedule?.closingTime) {
-                                    const [ch, cm] = employee.schedule.closingTime.split(':').map(Number);
-                                    const closingLocal = new Date(`${clockInDay}T${String(ch).padStart(2,'0')}:${String(cm).padStart(2,'0')}:00`);
-                                    const tzOff = new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
-                                    closingUTC = new Date(closingLocal.getTime() - tzOff);
-                                }
-
-                                const isPastClosing = closingUTC && now > closingUTC;
-
-                                if (isDifferentDay || isPastClosing) {
-                                    // Clock out at scheduled closing time (or clock-in time + 8h if no schedule)
-                                    const clockOutTime = closingUTC || new Date(clockInDate.getTime() + 8 * 3600000);
+                                // Only retroactively close if it's genuinely a previous day's session
+                                if (isDifferentDay) {
+                                    // Clock out at scheduled closing time on the clock-in day
+                                    let clockOutTime;
+                                    if (employee.schedule?.closingTime) {
+                                        const [ch, cm] = employee.schedule.closingTime.split(':').map(Number);
+                                        // Build closing time in local timezone on the clock-in day
+                                        clockOutTime = new Date(`${clockInDay}T${String(ch).padStart(2,'0')}:${String(cm).padStart(2,'0')}:00`);
+                                    } else {
+                                        // Fallback: clock-in time + 8 hours
+                                        clockOutTime = new Date(clockInDate.getTime() + 8 * 3600000);
+                                    }
                                     const breakMin = employee.assignedBreakMinutes || 0;
-                                    const grossMin = (clockOutTime - clockInDate) / 60000;
+                                    const grossMin = Math.max(0, (clockOutTime - clockInDate) / 60000);
                                     const paidMin = Math.max(0, grossMin - breakMin);
                                     const paidHours = parseFloat((paidMin / 60).toFixed(2));
                                     const rate = employee.hourlyRate || 0;
@@ -1045,6 +1044,7 @@
                                     };
                                     if (useFirebase) FirebaseDB.saveEmployee(restoredEmployee);
                                 }
+                                // Same day session: leave clockedIn:true — employee is still on shift
                             }
 
                             // AUTO CLOCK-IN on session restore (same as login)
@@ -1307,11 +1307,14 @@
                         const tzOffsetMs = () => new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
 
                         // AUTO CLOCK-OUT at scheduled closing time
-                        if (emp.clockedIn && emp.schedule?.closingTime) {
+                        // Guard: only fire once per employee per day using localStorage key
+                        const autoOutKey = `autoClockOut_${emp.id}_${todayStr}`;
+                        if (emp.clockedIn && emp.schedule?.closingTime && !localStorage.getItem(autoOutKey)) {
                             const [ch, cm] = emp.schedule?.closingTime.split(':').map(Number);
                             const autoOutLocal = new Date(`${todayStr}T${String(ch).padStart(2,'0')}:${String(cm).padStart(2,'0')}:00`);
                             const autoOutUTC = new Date(autoOutLocal.getTime() - tzOffsetMs());
                             if (now >= autoOutUTC) {
+                                localStorage.setItem(autoOutKey, '1');
                                 const breakMin = emp.assignedBreakMinutes || 0;
                                 const grossMin = (now - new Date(emp.clockInTime)) / 60000;
                                 const paidMin = Math.max(0, grossMin - breakMin);
@@ -1368,8 +1371,10 @@
                 return () => clearInterval(interval);
             }, [currentView, employees, owner]);
 
-            const handleOwnerLogin = (e) => {
+            const handleOwnerLogin = async (e) => {
                 e.preventDefault();
+                // Close missed sessions for all employees on owner login too
+                await checkAndCloseMissedSessions();
                 // Use the already-loaded owner state (from Firebase) instead of stale localStorage
                 if (loginForm.username === owner.username && loginForm.password === owner.password) {
                     SessionManager.saveSession('owner', { username: owner.username });
@@ -1588,9 +1593,78 @@
                 sessionStorage.removeItem('resetCodeTime');
             };
 
+            // ── CHECK ALL EMPLOYEES FOR MISSED CLOCK-OUTS ──
+            // Runs on any employee login — no server needed
+            // Closes any session where clockedIn:true but clock-in was on a previous day
+            const checkAndCloseMissedSessions = async () => {
+                const now = new Date();
+                let anyChanged = false;
+                const updatedEmployees = employees.map(emp => {
+                    if (!emp.clockedIn || !emp.clockInTime) return emp;
+                    const tz = emp.schedule?.timezone || 'America/Toronto';
+                    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
+                    const clockInDate = new Date(emp.clockInTime);
+                    const clockInDay = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(clockInDate);
+                    if (todayStr === clockInDay) return emp; // Same day — still on shift, skip
+                    // Previous day — close the session at scheduled closing time
+                    let clockOutTime;
+                    if (emp.schedule?.closingTime) {
+                        const [ch, cm] = emp.schedule.closingTime.split(':').map(Number);
+                        clockOutTime = new Date(`${clockInDay}T${String(ch).padStart(2,'0')}:${String(cm).padStart(2,'0')}:00`);
+                    } else {
+                        clockOutTime = new Date(clockInDate.getTime() + 8 * 3600000);
+                    }
+                    const breakMin = emp.assignedBreakMinutes || 0;
+                    const grossMin = Math.max(0, (clockOutTime - clockInDate) / 60000);
+                    const paidMin = Math.max(0, grossMin - breakMin);
+                    const paidHours = parseFloat((paidMin / 60).toFixed(2));
+                    const rate = emp.hourlyRate || 0;
+                    const pay = parseFloat((paidHours * rate).toFixed(2));
+                    // Prevent duplicate entry — check if this clockIn already has a clockOut
+                    const alreadyClosed = (emp.workHistory || []).some(e => e.clockIn === emp.clockInTime && e.clockOut);
+                    if (alreadyClosed) {
+                        // Just clear the stale clockedIn flag
+                        anyChanged = true;
+                        return { ...emp, clockedIn: false, isLateToday: false, minutesLate: 0 };
+                    }
+                    const entry = {
+                        id: Date.now() + Math.random(),
+                        date: clockOutTime.toISOString(),
+                        clockIn: emp.clockInTime,
+                        clockOut: clockOutTime.toISOString(),
+                        grossMinutes: Math.round(grossMin),
+                        breakMinutes: breakMin,
+                        paidMinutes: Math.round(paidMin),
+                        paidHours, hourlyRate: rate, pay,
+                        autoClockOut: true,
+                        missedClockOut: true
+                    };
+                    anyChanged = true;
+                    return {
+                        ...emp,
+                        clockedIn: false,
+                        clockOutTime: clockOutTime.toISOString(),
+                        workHistory: [...(emp.workHistory || []), entry],
+                        isLateToday: false,
+                        minutesLate: 0
+                    };
+                });
+                if (anyChanged) {
+                    setEmployees(updatedEmployees);
+                    if (useFirebase) {
+                        const changed = updatedEmployees.filter((e, i) => e !== employees[i]);
+                        await Promise.all(changed.map(e => FirebaseDB.saveEmployee(e)));
+                    }
+                }
+                return updatedEmployees;
+            };
+
             const handleEmployeeLogin = async (e) => {
                 e.preventDefault();
-                
+
+                // Close any missed sessions for all employees on login
+                await checkAndCloseMissedSessions();
+
                 const employee = employees.find(
                     emp => emp.username === loginForm.username && emp.password === loginForm.password
                 );
@@ -3478,8 +3552,16 @@
 
                                             const hourlyEmployees = employees.filter(e => e.isHourly);
                                             const filteredTotals = hourlyEmployees.map(emp => {
-                                                const entries = (emp.workHistory || [])
-                                                    .filter(e => { const d = new Date(e.date); return d >= rangeFrom && d <= rangeTo; })
+                                                // Deduplicate by clockIn timestamp to prevent duplicate auto-out entries
+                                const seen = new Set();
+                                const entries = (emp.workHistory || [])
+                                                    .filter(e => {
+                                                        const key = e.clockIn + '_' + e.clockOut;
+                                                        if (seen.has(key)) return false;
+                                                        seen.add(key);
+                                                        const d = new Date(e.date);
+                                                        return d >= rangeFrom && d <= rangeTo;
+                                                    })
                                                     .sort((a,b) => new Date(b.date) - new Date(a.date));
                                                 const mins = entries.reduce((s,e) => s + (e.paidMinutes || 0), 0);
                                                 return { emp, entries, mins };
@@ -5579,6 +5661,13 @@ if (currentView === 'employeeDashboard') {
                                             <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
                                         )}
                                     </button>
+                                    <button
+                                        onClick={() => setEmployeeView(v => v === 'shifts' ? 'dashboard' : 'shifts')}
+                                        className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all font-medium text-sm ${employeeView === 'shifts' ? 'bg-blue-600 text-white' : 'bg-slate-700/50 text-white hover:bg-slate-700'}`}
+                                    >
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+                                        Work History
+                                    </button>
                                     <a
                                         href="https://amandeepsin.github.io/customer-call-logs-portal/"
                                         target="_blank"
@@ -5610,6 +5699,71 @@ if (currentView === 'employeeDashboard') {
                                 </div>
                             )}
                             
+
+
+                            {/* ── MY SHIFTS VIEW ── */}
+                            {employeeView === 'shifts' && (() => {
+                                const emp = currentEmployee;
+                                const history = (emp.workHistory || []).slice().sort((a,b) => new Date(b.date) - new Date(a.date));
+                                const fmtDate = (iso) => {
+                                    if (!iso) return '';
+                                    const d = new Date(iso);
+                                    return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+                                };
+                                const fmtTime = (iso) => {
+                                    if (!iso) return '--';
+                                    const d = new Date(iso);
+                                    const h = d.getHours(), m = String(d.getMinutes()).padStart(2,'0');
+                                    return `${h%12||12}:${m} ${h>=12?'PM':'AM'}`;
+                                };
+                                const fmtDur = (mins) => {
+                                    if (!mins && mins !== 0) return '--';
+                                    const h = Math.floor(mins/60), m = Math.round(mins%60);
+                                    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+                                };
+                                const now = new Date();
+                                const totalMonthMins = history.filter(e => {
+                                    const d = new Date(e.date);
+                                    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+                                }).reduce((s,e) => s + (e.paidMinutes||0), 0);
+                                const totalMins = history.reduce((s,e) => s + (e.paidMinutes||0), 0);
+                                const avgMins = history.length > 0 ? Math.round(totalMins / history.length) : 0;
+                                return (
+                                    <div className="max-w-5xl mx-auto px-6 py-6">
+                                        <div className="grid grid-cols-3 gap-3 mb-5">
+                                            <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-3">
+                                                <div className="text-slate-400 text-xs mb-1">This month</div>
+                                                <div className="text-white font-semibold text-lg">{fmtDur(totalMonthMins)}</div>
+                                            </div>
+                                            <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-3">
+                                                <div className="text-slate-400 text-xs mb-1">Total shifts</div>
+                                                <div className="text-white font-semibold text-lg">{history.length}</div>
+                                            </div>
+                                            <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-3">
+                                                <div className="text-slate-400 text-xs mb-1">Avg shift</div>
+                                                <div className="text-white font-semibold text-lg">{fmtDur(avgMins)}</div>
+                                            </div>
+                                        </div>
+                                        {history.length === 0 ? (
+                                            <div className="text-center py-12 text-slate-500">No shifts recorded yet</div>
+                                        ) : (
+                                            <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">
+                                                {history.map((entry, idx) => (
+                                                    <div key={entry.id || idx} className="flex items-center gap-3 px-4 py-2.5 border-b border-slate-700/30 last:border-b-0">
+                                                        <span className="text-slate-400 text-xs w-20 flex-shrink-0">{fmtDate(entry.date)}</span>
+                                                        <span className="text-slate-300 text-xs flex-1 truncate">{fmtTime(entry.clockIn)} – {fmtTime(entry.clockOut)} · {entry.breakMinutes||0}m break</span>
+                                                        {entry.autoClockOut && <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-400 flex-shrink-0">auto</span>}
+                                                        {entry.edited && <span className="text-xs px-1.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-400 flex-shrink-0">edited</span>}
+                                                        <span className={`text-xs font-semibold flex-shrink-0 w-12 text-right ${(entry.paidMinutes||0) > 0 ? 'text-green-400' : 'text-slate-500'}`}>{fmtDur(entry.paidMinutes||0)}</span>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })()}
+
+                            <div style={{display: employeeView === 'shifts' ? 'none' : 'block'}}>
 
                             {/* ── CLOCK IN / OUT CARD ── */}
                             {(() => {
@@ -5915,7 +6069,7 @@ if (currentView === 'employeeDashboard') {
                                                                 t => t.assignedBy === (currentEmployee.username || currentEmployee.name)
                                                             );
                                                             return myTasks.filter(t => !t.completed).length;
-                                                        })()}) pending)
+                                                        })()}) pending
                                                     </span>
                                                 </h4>
                                                 
@@ -6037,6 +6191,8 @@ if (currentView === 'employeeDashboard') {
                                 </div>
                                 
                             </div>
+                            </div>
+
                 );
             }
             
