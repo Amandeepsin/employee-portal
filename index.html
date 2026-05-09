@@ -492,8 +492,8 @@
                     return { allowed, ip: userIP, allowedIPs: employee.allowedIPs };
                 } catch (error) {
                     console.error('Error checking IP:', error);
-                    // If IP check fails, allow access (you can change this to deny if preferred)
-                    return { allowed: true, ip: 'IP check failed' };
+                    // Deny on failure — silently allowing would bypass geo-locking
+                    return { allowed: false, ip: 'IP verification failed — check your connection or contact your manager.' };
                 }
             }
         };
@@ -547,6 +547,23 @@
                 'customerCallLogs'
             ],
 
+            // Per-day localStorage keys that pile up (autoClockOut_<id>_<date>, lateAlert_<id>_<date>)
+            // — older than 60 days are deleted to prevent unbounded growth.
+            cleanupOldDayKeys: () => {
+                try {
+                    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 60);
+                    const cutoffStr = cutoff.toISOString().split('T')[0];
+                    const toRemove = [];
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        if (!k) continue;
+                        const m = k.match(/^(autoClockOut|lateAlert)_\d+_(\d{4}-\d{2}-\d{2})$/);
+                        if (m && m[2] < cutoffStr) toRemove.push(k);
+                    }
+                    toRemove.forEach(k => localStorage.removeItem(k));
+                } catch(_) {}
+            },
+
             getLastCleared: () => {
                 const stored = localStorage.getItem(CacheManager.CACHE_KEY);
                 return stored ? parseInt(stored, 10) : null;
@@ -564,6 +581,7 @@
 
             clear: () => {
                 CacheManager.CLEARABLE_KEYS.forEach(key => localStorage.removeItem(key));
+                CacheManager.cleanupOldDayKeys(); // also remove old per-day guard keys
                 CacheManager.setLastCleared();
             },
 
@@ -648,10 +666,6 @@
             
             saveEmployees: (employees) => {
                 localStorage.setItem('employees', JSON.stringify(employees));
-            },
-            
-            saveOwner: (owner) => {
-                localStorage.setItem('owner', JSON.stringify(owner));
             },
             
             // Customer Service Data
@@ -864,6 +878,193 @@
         };
 
         const App = () => {
+            // ════════════════════════════════════════════════════════════════
+            // TIMEUTIL — single source of truth for all date/time/timezone logic
+            // ════════════════════════════════════════════════════════════════
+            // Every clock-in, clock-out, edit, display, filter, and retroactive close
+            // routes through this module. Times are stored as UTC ISO strings;
+            // every display and parsing operation uses the EMPLOYEE's timezone,
+            // never the browser's local time.
+            const TimeUtil = {
+                // Default timezone fallback if employee has none configured
+                defaultTZ: 'America/Toronto',
+
+                tzFor: (emp) => emp?.schedule?.timezone || TimeUtil.defaultTZ,
+
+                // Convert a local date+time in a specific IANA timezone to a UTC Date.
+                // DST-safe — uses Intl.DateTimeFormat to find the true offset,
+                // unlike the toLocaleString subtraction hack which breaks on DST.
+                parseInTZ: (dateStr, timeStr, tz) => {
+                    if (!dateStr || !timeStr) return null;
+                    const [year, month, day] = dateStr.split('-').map(Number);
+                    const [hour, minute]     = timeStr.split(':').map(Number);
+                    const approx = new Date(Date.UTC(year, month - 1, day, hour, minute));
+                    const parts = new Intl.DateTimeFormat('en-CA', {
+                        timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
+                        hour:'2-digit', minute:'2-digit', hour12: false
+                    }).formatToParts(approx);
+                    const get = (t) => parseInt(parts.find(p => p.type === t)?.value || '0');
+                    const drift = (hour - get('hour'))*3600000 + (minute - get('minute'))*60000 + (day - get('day'))*86400000;
+                    return new Date(approx.getTime() + drift);
+                },
+
+                // Parse a clock-in/out for an employee — uses the employee's timezone
+                parseEmployeeTime: (emp, dateStr, timeStr) =>
+                    TimeUtil.parseInTZ(dateStr, timeStr, TimeUtil.tzFor(emp)),
+
+                // Today's date string (YYYY-MM-DD) in the employee's timezone
+                todayInEmployeeTZ: (emp) =>
+                    new Intl.DateTimeFormat('en-CA', { timeZone: TimeUtil.tzFor(emp) }).format(new Date()),
+
+                // Get the date string of an ISO timestamp in the employee's timezone
+                dateInEmployeeTZ: (emp, iso) => {
+                    if (!iso) return '';
+                    return new Intl.DateTimeFormat('en-CA', { timeZone: TimeUtil.tzFor(emp) }).format(new Date(iso));
+                },
+
+                // Format an ISO timestamp as a 12-hour time in the employee's timezone (e.g. "9:30 AM")
+                formatEmployeeTime: (emp, iso) => {
+                    if (!iso) return '--:--';
+                    const tz = TimeUtil.tzFor(emp);
+                    const parts = new Intl.DateTimeFormat('en-US', {
+                        timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true
+                    }).formatToParts(new Date(iso));
+                    const h = parts.find(p => p.type === 'hour')?.value || '12';
+                    const m = parts.find(p => p.type === 'minute')?.value || '00';
+                    const a = parts.find(p => p.type === 'dayPeriod')?.value || 'AM';
+                    return `${h}:${m} ${a}`;
+                },
+
+                // Format an ISO timestamp as a date in the employee's timezone (e.g. "Mon, Nov 9")
+                formatEmployeeDate: (emp, iso) => {
+                    if (!iso) return '';
+                    return new Intl.DateTimeFormat('en-US', {
+                        timeZone: TimeUtil.tzFor(emp), weekday: 'short', month: 'short', day: 'numeric'
+                    }).format(new Date(iso));
+                },
+
+                // Format HH:MM (24h) string as 12h display (e.g. "09:00" -> "9:00 AM")
+                format12h: (timeStr) => {
+                    if (!timeStr) return '';
+                    const [h, m] = timeStr.split(':').map(Number);
+                    const ampm = h >= 12 ? 'PM' : 'AM';
+                    return `${h % 12 || 12}:${String(m).padStart(2,'0')} ${ampm}`;
+                },
+
+                // Format HH:MM input fields — extract hour/minute in employee TZ from ISO
+                isoToFormFields: (emp, iso) => {
+                    if (!iso) return { date: '', time: '' };
+                    const tz = TimeUtil.tzFor(emp);
+                    const parts = new Intl.DateTimeFormat('en-CA', {
+                        timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
+                        hour:'2-digit', minute:'2-digit', hour12: false
+                    }).formatToParts(new Date(iso));
+                    const g = (t) => parts.find(p => p.type === t)?.value || '00';
+                    return { date: `${g('year')}-${g('month')}-${g('day')}`, time: `${g('hour')}:${g('minute')}` };
+                },
+
+                // Minutes between two ISO timestamps
+                minutesBetween: (isoA, isoB) => Math.max(0, (new Date(isoB) - new Date(isoA)) / 60000),
+
+                // Format a duration in minutes as a string (e.g. "8h 30m" or "45m")
+                formatDuration: (mins) => {
+                    if (mins == null) return '--';
+                    const h = Math.floor(mins / 60), m = Math.round(mins % 60);
+                    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+                },
+
+                // Compute lateness for clock-in `now` against scheduled start time
+                // Returns { minutesLate, isLate }. Caps at 720 min (12 h) so off-hours
+                // logins or weekend logins don't show as massively late.
+                computeLateness: (emp, now) => {
+                    if (!emp?.schedule?.openingTime) return { minutesLate: 0, isLate: false };
+                    const today  = TimeUtil.todayInEmployeeTZ(emp);
+                    const shiftUTC = TimeUtil.parseEmployeeTime(emp, today, emp.schedule.openingTime);
+                    if (!shiftUTC) return { minutesLate: 0, isLate: false };
+                    let minutesLate = Math.max(0, Math.round((now - shiftUTC) / 60000));
+                    if (minutesLate > 720) minutesLate = 0; // Off-hours / wrong-day login
+                    return { minutesLate, isLate: minutesLate > 0 };
+                }
+            };
+
+            // ════════════════════════════════════════════════════════════════
+            // ShiftRecorder — single source of truth for closing a shift
+            // ════════════════════════════════════════════════════════════════
+            // Every clock-out path (manual, force, auto, retroactive, sign-out, tab-close)
+            // routes through buildShiftEntry / closeShift. This guarantees:
+            //   - paid time, gross time, and pay are computed identically
+            //   - duplicate entries are deduplicated by clockIn timestamp
+            //   - assignedBreakMinutes is reset for the next shift
+            //   - isLateToday / minutesLate are reset
+            const ShiftRecorder = {
+                // Build a workHistory entry from raw inputs.
+                // `extra` lets callers tag the entry (autoClockOut, forcedByOwner, missedClockOut, closedTab).
+                buildEntry: (emp, clockInISO, clockOutISO, breakMin, extra = {}) => {
+                    const grossMin = TimeUtil.minutesBetween(clockInISO, clockOutISO);
+                    const paidMin  = Math.max(0, grossMin - (breakMin || 0));
+                    const paidHours= parseFloat((paidMin / 60).toFixed(2));
+                    const rate     = emp?.hourlyRate || 0;
+                    const pay      = parseFloat((paidHours * rate).toFixed(2));
+                    return {
+                        id: Date.now() + Math.random(),
+                        date: clockOutISO, // FIX: use clock-out date so date filters land correctly
+                        clockIn: clockInISO,
+                        clockOut: clockOutISO,
+                        grossMinutes: Math.round(grossMin),
+                        breakMinutes: breakMin || 0,
+                        paidMinutes: Math.round(paidMin),
+                        paidHours, hourlyRate: rate, pay,
+                        wasLate: emp?.isLateToday || false,
+                        minutesLate: emp?.minutesLate || 0,
+                        ...extra
+                    };
+                },
+
+                // Close a shift — returns the updated employee object.
+                // Dedupes on clockIn so we never write a second entry for the same shift.
+                closeShift: (emp, clockOutISO, extra = {}) => {
+                    if (!emp.clockedIn || !emp.clockInTime) return emp; // nothing to close
+                    const breakMin = emp.assignedBreakMinutes || 0;
+                    // Dedup: if we already have a closed entry for this clockIn, just clear the flag
+                    const normTS = (s) => s ? new Date(s).getTime() : 0;
+                    const alreadyClosed = (emp.workHistory || []).some(e =>
+                        normTS(e.clockIn) === normTS(emp.clockInTime) && e.clockOut
+                    );
+                    if (alreadyClosed) {
+                        return {
+                            ...emp,
+                            clockedIn: false,
+                            clockOutTime: clockOutISO,
+                            isLateToday: false,
+                            minutesLate: 0,
+                            assignedBreakMinutes: 0
+                        };
+                    }
+                    const entry = ShiftRecorder.buildEntry(emp, emp.clockInTime, clockOutISO, breakMin, extra);
+                    return {
+                        ...emp,
+                        clockedIn: false,
+                        clockOutTime: clockOutISO,
+                        workHistory: [...(emp.workHistory || []), entry],
+                        isLateToday: false,
+                        minutesLate: 0,
+                        assignedBreakMinutes: 0 // Reset for next shift
+                    };
+                },
+
+                // Open a new shift — sets clockedIn:true, computes lateness, sets clockInTime to now
+                openShift: (emp, now = new Date()) => {
+                    const { minutesLate, isLate } = TimeUtil.computeLateness(emp, now);
+                    return {
+                        ...emp,
+                        clockedIn: true,
+                        clockInTime: now.toISOString(),
+                        isLateToday: isLate,
+                        minutesLate
+                    };
+                }
+            };
+
             const [currentView, setCurrentView] = useState('selectRole');
             const [ownerDashboardView, setOwnerDashboardView] = useState('manage'); // 'manage', 'tasks'
             const [employees, setEmployees] = useState([]);
@@ -954,11 +1155,18 @@
             const [attendanceView, setAttendanceView] = useState('live');
             const [editingSession, setEditingSession] = useState(null); // {empId, entryId}
             const [editSessionForm, setEditSessionForm] = useState({});
+            // Date range defaults — use LOCAL date string, not toISOString (which is UTC).
+            // Otherwise an owner in Brampton at 10 PM sees "today" as tomorrow's UTC date,
+            // missing today's shifts.
+            const localDateStr = (d) => {
+                const pad = n => String(n).padStart(2,'0');
+                return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+            };
             const [historyDateFrom, setHistoryDateFrom] = useState(() => {
                 const d = new Date(); d.setDate(d.getDate() - 30);
-                return d.toISOString().split('T')[0]; // last 30 days default
+                return localDateStr(d);
             });
-            const [historyDateTo, setHistoryDateTo] = useState(() => new Date().toISOString().split('T')[0]);
+            const [historyDateTo, setHistoryDateTo] = useState(() => localDateStr(new Date()));
 
             // Check for existing session on mount + run cache cleanup if 7 days have passed
             useEffect(() => {
@@ -993,78 +1201,32 @@
                     if (session && session.type === 'employee') {
                         const employee = employees.find(emp => emp.id === session.data.id);
                         if (employee) {
-                            // RETROACTIVE CLOCK-OUT — ONLY if clocked in from a PREVIOUS calendar day
-                            // Never fire for same-day sessions — employee may still be working
+                            // RETROACTIVE CLOSE — only fires for previous-day sessions.
+                            // Uses TimeUtil/ShiftRecorder so the close time is correctly
+                            // anchored to the EMPLOYEE's timezone, not the browser's.
+                            // Does NOT auto-re-clock-in afterwards — employee clocks in manually.
                             let restoredEmployee = employee;
                             if (employee.clockedIn && employee.clockInTime) {
-                                const now = new Date();
-                                const clockInDate = new Date(employee.clockInTime);
-                                const tz = employee.schedule?.timezone || 'America/Toronto';
-                                const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-                                const clockInDay = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(clockInDate);
-                                const isDifferentDay = todayStr !== clockInDay;
-
-                                // Only retroactively close if it's genuinely a previous day's session
-                                if (isDifferentDay) {
-                                    // Clock out at scheduled closing time on the clock-in day
-                                    let clockOutTime;
+                                const today      = TimeUtil.todayInEmployeeTZ(employee);
+                                const clockInDay = TimeUtil.dateInEmployeeTZ(employee, employee.clockInTime);
+                                if (today !== clockInDay) {
+                                    // Close at scheduled closing time on the original clock-in day
+                                    let clockOutISO;
                                     if (employee.schedule?.closingTime) {
-                                        const [ch, cm] = employee.schedule.closingTime.split(':').map(Number);
-                                        // Build closing time in local timezone on the clock-in day
-                                        clockOutTime = new Date(`${clockInDay}T${String(ch).padStart(2,'0')}:${String(cm).padStart(2,'0')}:00`);
+                                        const closeUTC = TimeUtil.parseEmployeeTime(employee, clockInDay, employee.schedule.closingTime);
+                                        clockOutISO = closeUTC.toISOString();
                                     } else {
-                                        // Fallback: clock-in time + 8 hours
-                                        clockOutTime = new Date(clockInDate.getTime() + 8 * 3600000);
+                                        clockOutISO = new Date(new Date(employee.clockInTime).getTime() + 8 * 3600000).toISOString();
                                     }
-                                    const breakMin = employee.assignedBreakMinutes || 0;
-                                    const grossMin = Math.max(0, (clockOutTime - clockInDate) / 60000);
-                                    const paidMin = Math.max(0, grossMin - breakMin);
-                                    const paidHours = parseFloat((paidMin / 60).toFixed(2));
-                                    const rate = employee.hourlyRate || 0;
-                                    const pay = parseFloat((paidHours * rate).toFixed(2));
-                                    const entry = {
-                                        id: Date.now(),
-                                        date: clockOutTime.toISOString(),
-                                        clockIn: employee.clockInTime,
-                                        clockOut: clockOutTime.toISOString(),
-                                        grossMinutes: Math.round(grossMin),
-                                        breakMinutes: breakMin,
-                                        paidMinutes: Math.round(paidMin),
-                                        paidHours, hourlyRate: rate, pay,
-                                        autoClockOut: true,
-                                        missedClockOut: true
-                                    };
-                                    restoredEmployee = {
-                                        ...employee,
-                                        clockedIn: false,
-                                        clockOutTime: clockOutTime.toISOString(),
-                                        workHistory: [...(employee.workHistory || []), entry],
-                                        isLateToday: false,
-                                        minutesLate: 0
-                                    };
+                                    restoredEmployee = ShiftRecorder.closeShift(employee, clockOutISO, {
+                                        autoClockOut: true, missedClockOut: true
+                                    });
                                     if (useFirebase) FirebaseDB.saveEmployee(restoredEmployee);
                                 }
-                                // Same day session: leave clockedIn:true — employee is still on shift
                             }
-
-                            // AUTO CLOCK-IN on session restore (same as login)
-                            if (!restoredEmployee.clockedIn) {
-                                const now = new Date();
-                                const tz = employee.schedule?.timezone || 'America/Toronto';
-                                const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-                                let minutesLate = 0, isLate = false;
-                                if (employee.schedule?.openingTime) {
-                                    const [oh, om] = employee.schedule.openingTime.split(':').map(Number);
-                                    const shiftLocal = new Date(`${todayStr}T${String(oh).padStart(2,'0')}:${String(om).padStart(2,'0')}:00`);
-                                    const tzOff = new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
-                                    const shiftUTC = new Date(shiftLocal.getTime() - tzOff);
-                                    minutesLate = Math.max(0, Math.round((now - shiftUTC) / 60000));
-                                    isLate = minutesLate > 0;
-                                }
-                                restoredEmployee = { ...employee, clockedIn: true, clockInTime: now.toISOString(), isLateToday: isLate, minutesLate };
-                                // Update in employees array and Firebase
+                            // No auto-re-clock-in — employee lands on dashboard and clocks in manually
+                            if (restoredEmployee !== employee) {
                                 setEmployees(prev => prev.map(e => e.id === employee.id ? restoredEmployee : e));
-                                if (useFirebase) FirebaseDB.saveEmployee(restoredEmployee);
                             }
                             setCurrentEmployee(restoredEmployee);
                             setCurrentView('employeeDashboard');
@@ -1073,18 +1235,22 @@
                     return;
                 }
 
-                // Keep currentEmployee in sync with live Firebase data (Fix: owner changes reflect on employee side)
+                // Keep currentEmployee in sync with live Firebase data.
+                // Firebase is the source of truth — owner force-clock-out propagates immediately.
+                // We only override Firebase clockedIn:false with local true if the local clock-in
+                // happened in the last 3 seconds (i.e. Firebase write hasn't landed yet).
                 if (currentEmployee && currentView === 'employeeDashboard') {
                     const freshEmployee = employees.find(emp => emp.id === currentEmployee.id);
                     if (freshEmployee) {
-                        // Merge: preserve local clockedIn:true if Firebase hasn't persisted it yet
-                        const merged = {
+                        const localClockInRecent = currentEmployee.clockedIn && currentEmployee.clockInTime &&
+                            (Date.now() - new Date(currentEmployee.clockInTime).getTime() < 3000);
+                        const merged = localClockInRecent ? {
                             ...freshEmployee,
-                            clockedIn: currentEmployee.clockedIn || freshEmployee.clockedIn,
-                            clockInTime: currentEmployee.clockedIn ? currentEmployee.clockInTime : freshEmployee.clockInTime,
-                            isLateToday: currentEmployee.clockedIn ? currentEmployee.isLateToday : freshEmployee.isLateToday,
-                            minutesLate: currentEmployee.clockedIn ? currentEmployee.minutesLate : freshEmployee.minutesLate,
-                        };
+                            clockedIn: currentEmployee.clockedIn,
+                            clockInTime: currentEmployee.clockInTime,
+                            isLateToday: currentEmployee.isLateToday,
+                            minutesLate: currentEmployee.minutesLate,
+                        } : freshEmployee;
                         if (JSON.stringify(merged) !== JSON.stringify(currentEmployee)) {
                             setCurrentEmployee(merged);
                         }
@@ -1149,17 +1315,20 @@
                 };
             }, []);
 
-            // Save employees whenever they change — debounced to prevent race conditions
-            // and avoid flooding Firebase on every tiny state update (break timer ticks, etc.)
+            // Only write CHANGED employees to Firebase — avoids fan-out writes on every tick
+            const prevEmployeesRef = React.useRef([]);
             useEffect(() => {
                 if (loading || employees.length === 0) return;
                 Storage.saveEmployees(employees);
                 if (!useFirebase) return;
-                const timer = setTimeout(() => {
-                    employees.forEach(emp => {
-                        FirebaseDB.saveEmployee(emp);
-                    });
-                }, 1500);
+                const prev = prevEmployeesRef.current;
+                const changed = employees.filter(emp => {
+                    const old = prev.find(e => e.id === emp.id);
+                    return !old || JSON.stringify(old) !== JSON.stringify(emp);
+                });
+                prevEmployeesRef.current = employees;
+                if (changed.length === 0) return;
+                const timer = setTimeout(() => { changed.forEach(emp => FirebaseDB.saveEmployee(emp)); }, 1500);
                 return () => clearTimeout(timer);
             }, [employees, loading]);
             
@@ -1246,43 +1415,24 @@
                 return () => clearInterval(interval);
             }, []);
 
-            // Warn employee if they try to close tab while clocked in
+            // Warn employee + persist clock-out to localStorage when they close the tab.
+            // Async Firebase writes won't complete before the page dies, so we write to
+            // localStorage SYNCHRONOUSLY. Next login's checkAndCloseMissedSessions will
+            // pick it up and push to Firebase.
             useEffect(() => {
                 const handleBeforeUnload = (e) => {
                     if (currentView === 'employeeDashboard' && currentEmployee?.clockedIn) {
-                        // Attempt silent clock-out before tab closes
-                        const now = new Date();
-                        const breakMin = currentEmployee.assignedBreakMinutes || 0;
-                        const grossMin = (now - new Date(currentEmployee.clockInTime)) / 60000;
-                        const paidMin = Math.max(0, grossMin - breakMin);
-                        const paidHours = parseFloat((paidMin / 60).toFixed(2));
-                        const rate = currentEmployee.hourlyRate || 0;
-                        const pay = parseFloat((paidHours * rate).toFixed(2));
-                        const entry = {
-                            id: Date.now(),
-                            date: now.toISOString(),
-                            clockIn: currentEmployee.clockInTime,
-                            clockOut: now.toISOString(),
-                            grossMinutes: Math.round(grossMin),
-                            breakMinutes: breakMin,
-                            paidMinutes: Math.round(paidMin),
-                            paidHours, hourlyRate: rate, pay,
-                            wasLate: currentEmployee.isLateToday || false,
-                            minutesLate: currentEmployee.minutesLate || 0,
-                            autoClockOut: true,
-                            closedTab: true
-                        };
-                        const updated = {
-                            ...currentEmployee,
-                            clockedIn: false,
-                            clockOutTime: now.toISOString(),
-                            workHistory: [...(currentEmployee.workHistory || []), entry],
-                        };
-                        // Use sendBeacon for reliable fire-and-forget on tab close
-                        if (useFirebase) {
-                            try { FirebaseDB.saveEmployee(updated); } catch(e) {}
-                        }
-                        // Show browser warning as backup
+                        const updated = ShiftRecorder.closeShift(currentEmployee, new Date().toISOString(), {
+                            autoClockOut: true, closedTab: true
+                        });
+                        try {
+                            const stored = localStorage.getItem('employees');
+                            if (stored) {
+                                const emps = JSON.parse(stored);
+                                const idx  = emps.findIndex(em => em.id === updated.id);
+                                if (idx !== -1) { emps[idx] = updated; localStorage.setItem('employees', JSON.stringify(emps)); }
+                            }
+                        } catch(_) {}
                         e.preventDefault();
                         e.returnValue = 'You are still clocked in. Please click "End Shift & Sign Out" before leaving.';
                         return e.returnValue;
@@ -1290,11 +1440,13 @@
                 };
                 window.addEventListener('beforeunload', handleBeforeUnload);
                 return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-            }, [currentView, currentEmployee, employees]);
+            }, [currentView, currentEmployee]);
 
-            // Auto clock-out + late alert checker — runs every 60s on owner dashboard
+            // Auto clock-out + late alert checker — runs whenever the app is open,
+            // not only when owner is on the dashboard. This means closing-time auto-out
+            // fires regardless of which page anyone is viewing.
             useEffect(() => {
-                if (currentView !== 'ownerDashboard') return;
+                if (currentView === 'selectRole') return; // only run when someone is logged in
                 const GRACE_MINUTES = 5;
 
                 const check = () => {
@@ -1302,58 +1454,39 @@
                     let anyChange = false;
                     const updated = employees.map(emp => {
                         if (!emp.schedule) return emp;
-                        const tz = emp.schedule?.timezone || 'America/Toronto';
-                        const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-                        const tzOffsetMs = () => new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
+                        const today = TimeUtil.todayInEmployeeTZ(emp);
 
-                        // AUTO CLOCK-OUT at scheduled closing time
-                        // Guard: only fire once per employee per day using localStorage key
-                        const autoOutKey = `autoClockOut_${emp.id}_${todayStr}`;
+                        // AUTO CLOCK-OUT at scheduled closing time (once per day, guarded by localStorage key)
+                        const autoOutKey = `autoClockOut_${emp.id}_${today}`;
                         if (emp.clockedIn && emp.schedule?.closingTime && !localStorage.getItem(autoOutKey)) {
-                            const [ch, cm] = emp.schedule?.closingTime.split(':').map(Number);
-                            const autoOutLocal = new Date(`${todayStr}T${String(ch).padStart(2,'0')}:${String(cm).padStart(2,'0')}:00`);
-                            const autoOutUTC = new Date(autoOutLocal.getTime() - tzOffsetMs());
-                            if (now >= autoOutUTC) {
+                            const closeUTC = TimeUtil.parseEmployeeTime(emp, today, emp.schedule.closingTime);
+                            if (closeUTC && now >= closeUTC) {
                                 localStorage.setItem(autoOutKey, '1');
-                                const breakMin = emp.assignedBreakMinutes || 0;
-                                const grossMin = (now - new Date(emp.clockInTime)) / 60000;
-                                const paidMin = Math.max(0, grossMin - breakMin);
-                                const paidHours = parseFloat((paidMin / 60).toFixed(2));
-                                const pay = parseFloat((paidHours * (emp.hourlyRate || 0)).toFixed(2));
-                                const entry = {
-                                    id: Date.now() + Math.random(),
-                                    date: now.toISOString(),
-                                    clockIn: emp.clockInTime,
-                                    clockOut: now.toISOString(),
-                                    grossMinutes: Math.round(grossMin),
-                                    breakMinutes: breakMin,
-                                    paidMinutes: Math.round(paidMin),
-                                    paidHours, hourlyRate: emp.hourlyRate || 0, pay,
-                                    autoClockOut: true
-                                };
+                                // Use SCHEDULED close time, not `now` (which can be ≤60s late)
                                 anyChange = true;
-                                return { ...emp, clockedIn: false, clockOutTime: now.toISOString(), workHistory: [...(emp.workHistory||[]), entry] };
+                                return ShiftRecorder.closeShift(emp, closeUTC.toISOString(), { autoClockOut: true });
                             }
                         }
 
-                        // LATE ALERT — fires once per day, 5 min after shift start (only if clockInAlert enabled)
+                        // LATE ALERT — fires once per day, 5 min after shift start
                         if (emp.clockInAlert && !emp.clockedIn && emp.schedule?.openingTime) {
-                            const [oh, om] = emp.schedule?.openingTime.split(':').map(Number);
-                            const shiftLocal = new Date(`${todayStr}T${String(oh).padStart(2,'0')}:${String(om).padStart(2,'0')}:00`);
-                            const shiftUTC = new Date(shiftLocal.getTime() - tzOffsetMs());
-                            const minsLate = (now - shiftUTC) / 60000;
-                            const alertKey = `lateAlert_${emp.id}_${todayStr}`;
-                            if (minsLate >= GRACE_MINUTES && minsLate < 480 && !localStorage.getItem(alertKey)) {
-                                localStorage.setItem(alertKey, '1');
-                                if (typeof emailjs !== 'undefined' && owner?.email) {
-                                    try {
-                                        emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-                                            to_email: owner.email,
-                                            to_name: 'Owner',
-                                            from_name: 'WorkFlow',
-                                            verification_code: `ALERT: ${emp.name} has not clocked in. Shift started ${Math.round(minsLate)} minutes ago.`
-                                        });
-                                    } catch(e) {}
+                            const shiftUTC = TimeUtil.parseEmployeeTime(emp, today, emp.schedule.openingTime);
+                            if (shiftUTC) {
+                                const minsLate = (now - shiftUTC) / 60000;
+                                const alertKey = `lateAlert_${emp.id}_${today}`;
+                                if (minsLate >= GRACE_MINUTES && minsLate < 480 && !localStorage.getItem(alertKey)) {
+                                    localStorage.setItem(alertKey, '1');
+                                    if (typeof emailjs !== 'undefined' && owner?.email) {
+                                        try {
+                                            emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
+                                                to_email: owner.email,
+                                                to_name: 'Owner',
+                                                from_name: 'WorkFlow',
+                                                message: `LATE ALERT: ${emp.name} has not clocked in. Shift started ${Math.round(minsLate)} minute(s) ago.`,
+                                                verification_code: ''
+                                            });
+                                        } catch(_) {}
+                                    }
                                 }
                             }
                         }
@@ -1362,7 +1495,7 @@
 
                     if (anyChange) {
                         setEmployees(updated);
-                        if (useFirebase) updated.forEach(emp => FirebaseDB.saveEmployee(emp));
+                        if (useFirebase) updated.filter((e,i) => e !== employees[i]).forEach(emp => FirebaseDB.saveEmployee(emp));
                     }
                 };
 
@@ -1593,61 +1726,29 @@
                 sessionStorage.removeItem('resetCodeTime');
             };
 
-            // ── CHECK ALL EMPLOYEES FOR MISSED CLOCK-OUTS ──
-            // Runs on any employee login — no server needed
-            // Closes any session where clockedIn:true but clock-in was on a previous day
+            // Close any sessions where clockedIn:true but clock-in was on a previous day.
+            // Runs on any login — uses TimeUtil/ShiftRecorder for correct timezone handling
+            // and dedup-safe entry creation.
             const checkAndCloseMissedSessions = async () => {
-                const now = new Date();
                 let anyChanged = false;
                 const updatedEmployees = employees.map(emp => {
                     if (!emp.clockedIn || !emp.clockInTime) return emp;
-                    const tz = emp.schedule?.timezone || 'America/Toronto';
-                    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-                    const clockInDate = new Date(emp.clockInTime);
-                    const clockInDay = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(clockInDate);
-                    if (todayStr === clockInDay) return emp; // Same day — still on shift, skip
-                    // Previous day — close the session at scheduled closing time
-                    let clockOutTime;
+                    const today      = TimeUtil.todayInEmployeeTZ(emp);
+                    const clockInDay = TimeUtil.dateInEmployeeTZ(emp, emp.clockInTime);
+                    if (today === clockInDay) return emp; // Same day — still on shift
+                    // Previous day — close at scheduled closing time
+                    let clockOutISO;
                     if (emp.schedule?.closingTime) {
-                        const [ch, cm] = emp.schedule.closingTime.split(':').map(Number);
-                        clockOutTime = new Date(`${clockInDay}T${String(ch).padStart(2,'0')}:${String(cm).padStart(2,'0')}:00`);
+                        const closeUTC = TimeUtil.parseEmployeeTime(emp, clockInDay, emp.schedule.closingTime);
+                        clockOutISO = closeUTC.toISOString();
                     } else {
-                        clockOutTime = new Date(clockInDate.getTime() + 8 * 3600000);
+                        clockOutISO = new Date(new Date(emp.clockInTime).getTime() + 8 * 3600000).toISOString();
                     }
-                    const breakMin = emp.assignedBreakMinutes || 0;
-                    const grossMin = Math.max(0, (clockOutTime - clockInDate) / 60000);
-                    const paidMin = Math.max(0, grossMin - breakMin);
-                    const paidHours = parseFloat((paidMin / 60).toFixed(2));
-                    const rate = emp.hourlyRate || 0;
-                    const pay = parseFloat((paidHours * rate).toFixed(2));
-                    // Prevent duplicate entry — check if this clockIn already has a clockOut
-                    const alreadyClosed = (emp.workHistory || []).some(e => e.clockIn === emp.clockInTime && e.clockOut);
-                    if (alreadyClosed) {
-                        // Just clear the stale clockedIn flag
-                        anyChanged = true;
-                        return { ...emp, clockedIn: false, isLateToday: false, minutesLate: 0 };
-                    }
-                    const entry = {
-                        id: Date.now() + Math.random(),
-                        date: clockOutTime.toISOString(),
-                        clockIn: emp.clockInTime,
-                        clockOut: clockOutTime.toISOString(),
-                        grossMinutes: Math.round(grossMin),
-                        breakMinutes: breakMin,
-                        paidMinutes: Math.round(paidMin),
-                        paidHours, hourlyRate: rate, pay,
-                        autoClockOut: true,
-                        missedClockOut: true
-                    };
-                    anyChanged = true;
-                    return {
-                        ...emp,
-                        clockedIn: false,
-                        clockOutTime: clockOutTime.toISOString(),
-                        workHistory: [...(emp.workHistory || []), entry],
-                        isLateToday: false,
-                        minutesLate: 0
-                    };
+                    const closed = ShiftRecorder.closeShift(emp, clockOutISO, {
+                        autoClockOut: true, missedClockOut: true
+                    });
+                    if (closed !== emp) anyChanged = true;
+                    return closed;
                 });
                 if (anyChanged) {
                     setEmployees(updatedEmployees);
@@ -1683,22 +1784,11 @@
                 
                 SessionManager.saveSession('employee', { id: employee.id, username: employee.username });
 
-                // AUTO CLOCK-IN on login
+                // AUTO CLOCK-IN on login — uses ShiftRecorder.openShift which handles
+                // DST-safe lateness via TimeUtil.computeLateness (with 12h cap for off-hours)
                 let clockedInEmployee = employee;
                 if (!employee.clockedIn) {
-                    const now = new Date();
-                    const tz = employee.schedule?.timezone || 'America/Toronto';
-                    const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-                    let minutesLate = 0, isLate = false;
-                    if (employee.schedule?.openingTime) {
-                        const [oh, om] = employee.schedule.openingTime.split(':').map(Number);
-                        const shiftLocal = new Date(`${todayStr}T${String(oh).padStart(2,'0')}:${String(om).padStart(2,'0')}:00`);
-                        const tzOff = new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
-                        const shiftUTC = new Date(shiftLocal.getTime() - tzOff);
-                        minutesLate = Math.max(0, Math.round((now - shiftUTC) / 60000));
-                        isLate = minutesLate > 0;
-                    }
-                    clockedInEmployee = { ...employee, clockedIn: true, clockInTime: now.toISOString(), isLateToday: isLate, minutesLate };
+                    clockedInEmployee = ShiftRecorder.openShift(employee);
                     const updatedEmployees = employees.map(e => e.id === employee.id ? clockedInEmployee : e);
                     setEmployees(updatedEmployees);
                     if (useFirebase) FirebaseDB.saveEmployee(clockedInEmployee);
@@ -1711,35 +1801,10 @@
             };
 
             const handleEmployeeSignOut = () => {
-                // AUTO CLOCK-OUT on sign-out
+                // Auto clock-out on sign-out via ShiftRecorder (dedup-safe — won't double-write
+                // if handleClockOut already ran from the End Shift button).
                 if (currentEmployee?.clockedIn) {
-                    const now = new Date();
-                    const breakMin = currentEmployee.assignedBreakMinutes || 0;
-                    const grossMin = (now - new Date(currentEmployee.clockInTime)) / 60000;
-                    const paidMin = Math.max(0, grossMin - breakMin);
-                    const paidHours = parseFloat((paidMin / 60).toFixed(2));
-                    const rate = currentEmployee.hourlyRate || 0;
-                    const pay = parseFloat((paidHours * rate).toFixed(2));
-                    const entry = {
-                        id: Date.now(),
-                        date: now.toISOString(),
-                        clockIn: currentEmployee.clockInTime,
-                        clockOut: now.toISOString(),
-                        grossMinutes: Math.round(grossMin),
-                        breakMinutes: breakMin,
-                        paidMinutes: Math.round(paidMin),
-                        paidHours, hourlyRate: rate, pay,
-                        wasLate: currentEmployee.isLateToday || false,
-                        minutesLate: currentEmployee.minutesLate || 0
-                    };
-                    const updated = {
-                        ...currentEmployee,
-                        clockedIn: false,
-                        clockOutTime: now.toISOString(),
-                        workHistory: [...(currentEmployee.workHistory || []), entry],
-                        isLateToday: false,
-                        minutesLate: 0
-                    };
+                    const updated = ShiftRecorder.closeShift(currentEmployee, new Date().toISOString());
                     const updatedEmployees = employees.map(e => e.id === updated.id ? updated : e);
                     setEmployees(updatedEmployees);
                     if (useFirebase) FirebaseDB.saveEmployee(updated);
@@ -1750,98 +1815,29 @@
                 setError('');
             };
             
-            // ── FORCE CLOCK OUT (owner action) ──
+            // Force clock-out (owner action) — uses ShiftRecorder
             const handleForceClockOut = (empId) => {
                 const emp = employees.find(e => e.id === empId);
                 if (!emp || !emp.clockedIn) return;
-                const now = new Date();
-                const breakMin = emp.assignedBreakMinutes || 0;
-                const grossMin = (now - new Date(emp.clockInTime)) / 60000;
-                const paidMin = Math.max(0, grossMin - breakMin);
-                const paidHours = parseFloat((paidMin / 60).toFixed(2));
-                const rate = emp.hourlyRate || 0;
-                const pay = parseFloat((paidHours * rate).toFixed(2));
-                const entry = {
-                    id: Date.now(),
-                    date: now.toISOString(),
-                    clockIn: emp.clockInTime,
-                    clockOut: now.toISOString(),
-                    grossMinutes: Math.round(grossMin),
-                    breakMinutes: breakMin,
-                    paidMinutes: Math.round(paidMin),
-                    paidHours, hourlyRate: rate, pay,
-                    wasLate: emp.isLateToday || false,
-                    minutesLate: emp.minutesLate || 0,
-                    forcedByOwner: true
-                };
-                const updated = {
-                    ...emp,
-                    clockedIn: false,
-                    clockOutTime: now.toISOString(),
-                    workHistory: [...(emp.workHistory || []), entry],
-                    isLateToday: false,
-                    minutesLate: 0
-                };
+                const updated = ShiftRecorder.closeShift(emp, new Date().toISOString(), { forcedByOwner: true });
                 const updatedEmployees = employees.map(e => e.id === empId ? updated : e);
                 setEmployees(updatedEmployees);
                 if (useFirebase) FirebaseDB.saveEmployee(updated);
             };
 
-            // ── CLOCK IN ──
+            // Manual clock-in / clock-out via ShiftRecorder
             const handleClockIn = () => {
                 if (currentEmployee.clockedIn) return;
-                const now = new Date();
-                const tz = currentEmployee.schedule?.timezone || 'America/Toronto';
-                const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-                let minutesLate = 0;
-                let isLate = false;
-                if (currentEmployee.schedule?.openingTime) {
-                    const [oh, om] = currentEmployee.schedule?.openingTime.split(':').map(Number);
-                    const shiftStart = new Date(`${todayStr}T${String(oh).padStart(2,'0')}:${String(om).padStart(2,'0')}:00`);
-                    const tzOffsetMs = new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
-                    const shiftStartUTC = new Date(shiftStart.getTime() - tzOffsetMs);
-                    minutesLate = Math.max(0, Math.round((now - shiftStartUTC) / 60000));
-                    isLate = minutesLate > 0;
-                }
-                const updated = { ...currentEmployee, clockedIn: true, clockInTime: now.toISOString(), isLateToday: isLate, minutesLate };
+                const updated = ShiftRecorder.openShift(currentEmployee);
                 setCurrentEmployee(updated);
                 const updatedEmployees = employees.map(e => e.id === updated.id ? updated : e);
                 setEmployees(updatedEmployees);
                 if (useFirebase) FirebaseDB.saveEmployee(updated);
             };
 
-            // ── CLOCK OUT ──
             const handleClockOut = () => {
                 if (!currentEmployee.clockedIn) return;
-                const now = new Date();
-                const breakMin = currentEmployee.assignedBreakMinutes || 0;
-                const grossMin = (now - new Date(currentEmployee.clockInTime)) / 60000;
-                const paidMin = Math.max(0, grossMin - breakMin);
-                const paidHours = parseFloat((paidMin / 60).toFixed(2));
-                const rate = currentEmployee.hourlyRate || 0;
-                const pay = parseFloat((paidHours * rate).toFixed(2));
-                const entry = {
-                    id: Date.now(),
-                    date: now.toISOString(),
-                    clockIn: currentEmployee.clockInTime,
-                    clockOut: now.toISOString(),
-                    grossMinutes: Math.round(grossMin),
-                    breakMinutes: breakMin,
-                    paidMinutes: Math.round(paidMin),
-                    paidHours,
-                    hourlyRate: rate,
-                    pay,
-                    wasLate: currentEmployee.isLateToday || false,
-                    minutesLate: currentEmployee.minutesLate || 0
-                };
-                const updated = {
-                    ...currentEmployee,
-                    clockedIn: false,
-                    clockOutTime: now.toISOString(),
-                    workHistory: [...(currentEmployee.workHistory || []), entry],
-                    isLateToday: false,
-                    minutesLate: 0
-                };
+                const updated = ShiftRecorder.closeShift(currentEmployee, new Date().toISOString());
                 setCurrentEmployee(updated);
                 const updatedEmployees = employees.map(e => e.id === updated.id ? updated : e);
                 setEmployees(updatedEmployees);
@@ -1849,10 +1845,15 @@
             };
 
             // ── SESSION EDIT HELPERS ──
-            const recalcEntry = (form) => {
-                const clockIn = new Date(form.clockInDate + 'T' + form.clockInTime);
-                const clockOut = new Date(form.clockOutDate + 'T' + form.clockOutTime);
-                if (isNaN(clockIn) || isNaN(clockOut)) return { grossMin: 0, paidMin: 0, paidHours: 0, pay: 0 };
+            // Uses the EMPLOYEE's timezone for parsing form fields, not the browser's local time.
+            // Caller passes the empId so we know which timezone to use.
+            const recalcEntry = (form, emp) => {
+                const tz = TimeUtil.tzFor(emp);
+                const clockIn  = TimeUtil.parseInTZ(form.clockInDate,  form.clockInTime,  tz);
+                const clockOut = TimeUtil.parseInTZ(form.clockOutDate, form.clockOutTime, tz);
+                if (!clockIn || !clockOut || isNaN(clockIn) || isNaN(clockOut)) {
+                    return { grossMin: 0, paidMin: 0, paidHours: 0, pay: 0 };
+                }
                 const grossMin = Math.max(0, (clockOut - clockIn) / 60000);
                 const breakMin = parseInt(form.breakMinutes) || 0;
                 const paidMin = Math.max(0, grossMin - breakMin);
@@ -1862,33 +1863,38 @@
                 return { grossMin: Math.round(grossMin), paidMin: Math.round(paidMin), paidHours, pay };
             };
 
+            // Populate the edit form using the EMPLOYEE's timezone, not the browser's local time.
+            // Owner in any timezone sees the actual shift times.
             const handleEditSession = (empId, entry) => {
-                const ci = new Date(entry.clockIn);
-                const co = new Date(entry.clockOut);
-                const pad = (n) => String(n).padStart(2,'0');
-                const toDateStr = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-                const toTimeStr = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                const emp = employees.find(e => e.id === empId);
+                const inFields  = TimeUtil.isoToFormFields(emp, entry.clockIn);
+                const outFields = TimeUtil.isoToFormFields(emp, entry.clockOut);
                 setEditingSession({ empId, entryId: entry.id });
                 setEditSessionForm({
-                    clockInDate: toDateStr(ci), clockInTime: toTimeStr(ci),
-                    clockOutDate: toDateStr(co), clockOutTime: toTimeStr(co),
+                    clockInDate:  inFields.date,  clockInTime:  inFields.time,
+                    clockOutDate: outFields.date, clockOutTime: outFields.time,
                     breakMinutes: entry.breakMinutes || 0,
-                    hourlyRate: entry.hourlyRate || 0
+                    hourlyRate:   entry.hourlyRate   || 0
                 });
             };
 
             const handleSaveSession = (empId, entryId) => {
-                const f = editSessionForm;
-                const calc = recalcEntry(f);
-                const updatedEmployees = employees.map(emp => {
-                    if (emp.id !== empId) return emp;
+                const emp = employees.find(e => e.id === empId);
+                const f   = editSessionForm;
+                const tz  = TimeUtil.tzFor(emp);
+                const calc = recalcEntry(f, emp);
+                // Parse form values in the EMPLOYEE's timezone
+                const clockInISO  = TimeUtil.parseInTZ(f.clockInDate,  f.clockInTime,  tz)?.toISOString();
+                const clockOutISO = TimeUtil.parseInTZ(f.clockOutDate, f.clockOutTime, tz)?.toISOString();
+                const updatedEmployees = employees.map(em => {
+                    if (em.id !== empId) return em;
                     return {
-                        ...emp,
-                        workHistory: (emp.workHistory || []).map(e => e.id !== entryId ? e : {
+                        ...em,
+                        workHistory: (em.workHistory || []).map(e => e.id !== entryId ? e : {
                             ...e,
-                            date: new Date(f.clockInDate + 'T' + f.clockInTime).toISOString(),
-                            clockIn: new Date(f.clockInDate + 'T' + f.clockInTime).toISOString(),
-                            clockOut: new Date(f.clockOutDate + 'T' + f.clockOutTime).toISOString(),
+                            date: clockOutISO, // session date = clock-out date
+                            clockIn: clockInISO,
+                            clockOut: clockOutISO,
                             breakMinutes: parseInt(f.breakMinutes) || 0,
                             hourlyRate: parseFloat(f.hourlyRate) || 0,
                             grossMinutes: calc.grossMin,
@@ -1900,14 +1906,13 @@
                     };
                 });
                 setEmployees(updatedEmployees);
-                // Keep currentEmployee in sync if it's the same employee
                 if (currentEmployee?.id === empId) {
                     const updatedEmp = updatedEmployees.find(e => e.id === empId);
                     if (updatedEmp) setCurrentEmployee(updatedEmp);
                 }
                 if (useFirebase) {
-                    const emp = updatedEmployees.find(e => e.id === empId);
-                    if (emp) FirebaseDB.saveEmployee(emp);
+                    const em = updatedEmployees.find(e => e.id === empId);
+                    if (em) FirebaseDB.saveEmployee(em);
                 }
                 setEditingSession(null);
                 setEditSessionForm({});
@@ -1930,28 +1935,26 @@
                 }
             };
 
+            // Add a manual session — anchored to the EMPLOYEE's timezone.
+            // Pre-computes paid time so saving without edits gives correct values.
             const handleAddSession = (empId) => {
                 const emp = employees.find(e => e.id === empId);
                 if (!emp) return;
-                const today = new Date();
-                const pad = (n) => String(n).padStart(2,'0');
-                const todayStr = `${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`;
-                const open = emp.schedule?.openingTime || '09:00';
+                const today = TimeUtil.todayInEmployeeTZ(emp);
+                const open  = emp.schedule?.openingTime || '09:00';
                 const close = emp.schedule?.closingTime || '17:00';
-                const newEntry = {
-                    id: Date.now(),
-                    date: today.toISOString(),
-                    clockIn: new Date(todayStr + 'T' + open).toISOString(),
-                    clockOut: new Date(todayStr + 'T' + close).toISOString(),
-                    breakMinutes: emp.assignedBreakMinutes || 0,
-                    hourlyRate: emp.hourlyRate || 0,
-                    grossMinutes: 0, paidMinutes: 0, paidHours: 0, pay: 0,
-                    manualEntry: true
-                };
+                const clockInISO  = TimeUtil.parseEmployeeTime(emp, today, open).toISOString();
+                const clockOutISO = TimeUtil.parseEmployeeTime(emp, today, close).toISOString();
+                const newEntry = ShiftRecorder.buildEntry(emp, clockInISO, clockOutISO,
+                    emp.assignedBreakMinutes || 0, { manualEntry: true });
                 const updatedEmployees = employees.map(e =>
                     e.id === empId ? { ...e, workHistory: [...(e.workHistory || []), newEntry] } : e
                 );
                 setEmployees(updatedEmployees);
+                if (useFirebase) {
+                    const updEmp = updatedEmployees.find(e => e.id === empId);
+                    if (updEmp) FirebaseDB.saveEmployee(updEmp);
+                }
                 handleEditSession(empId, newEntry);
             };
 
@@ -1987,7 +1990,7 @@
                         <td>${fmtT(e.clockIn)}</td>
                         <td>${fmtT(e.clockOut)}${e.autoClockOut?' (auto)':''}</td>
                         <td>${e.breakMinutes||0} min</td>
-                        <td><strong>${fmtDur(e.paidMinutes||0)}</strong></td>
+                        <td><strong>${fmtDur(e.paidMinutes||0)}</strong></td><td>$${(e.pay||0).toFixed(2)}</td>
                     </tr>`).join('');
                 const html = `<!DOCTYPE html><html><head><title>${emp.name} — Work Hours Report</title>
                 <style>
@@ -2003,11 +2006,12 @@
                 </style></head><body>
                 <h1>${emp.name}</h1>
                 <h2>Work Hours Report · Generated ${new Date().toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}</h2>
-                <table><thead><tr><th>Date</th><th>Clock In</th><th>Clock Out</th><th>Break</th><th>Hours Worked</th></tr></thead>
+                <table><thead><tr><th>Date</th><th>Clock In</th><th>Clock Out</th><th>Break</th><th>Hours Worked</th><th>Pay ($)</th></tr></thead>
                 <tbody>${rows}</tbody></table>
                 <div class="totals" style="margin-top:20px;">
                     Total shifts: <strong>${entries.length}</strong> &nbsp;·&nbsp;
-                    Total hours worked: <strong>${fmtDur(totalPaid)}</strong>
+                    Total hours worked: <strong>${fmtDur(totalPaid)}</strong> &nbsp;·&nbsp;
+                    Total pay: <strong>$${entries.reduce((s,e)=>s+(e.pay||0),0).toFixed(2)}</strong>
                 </div>
                 </body></html>`;
                 const win = window.open('','_blank');
@@ -3475,30 +3479,17 @@
                                                 <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-slate-700/50 overflow-hidden">
                                                     <div className="p-4 border-b border-slate-700/50">
                                                         <h3 className="text-white font-bold text-lg">All employees — today</h3>
+                                                        <p className="text-slate-400 text-xs mt-1">Stale sessions (clocked in &gt; 24 h with no activity) are flagged.</p>
                                                     </div>
                                                     <div className="divide-y divide-slate-700/30">
                                                         {employees.map(emp => {
                                                             void clockTick; // drives 1s re-render for live elapsed
                                                             const now = new Date();
-                                                            const fmtDate = (iso) => {
-                                                                if (!iso) return '';
-                                                                return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-                                                            };
-                                                            const fmtTime = (iso) => {
-                                                                if (!iso) return '';
-                                                                const d = new Date(iso);
-                                                                const h = d.getHours();
-                                                                const m = String(d.getMinutes()).padStart(2,'0');
-                                                                const ampm = h >= 12 ? 'PM' : 'AM';
-                                                                return `${h % 12 || 12}:${m} ${ampm}`;
-                                                            };
-                                                            const fmtElapsed = (iso) => {
-                                                                if (!iso) return '';
-                                                                const mins = Math.floor((now - new Date(iso)) / 60000);
-                                                                const h = Math.floor(mins / 60);
-                                                                const m = mins % 60;
-                                                                return h > 0 ? `${h}h ${m}m` : `${m}m`;
-                                                            };
+                                                            // Display formatters use the EMPLOYEE's timezone, not the browser's
+                                                            const elapsedMins = emp.clockInTime
+                                                                ? Math.floor((now - new Date(emp.clockInTime)) / 60000)
+                                                                : 0;
+                                                            const isStaleSession = emp.clockedIn && elapsedMins > 24 * 60;
                                                             return (
                                                                 <div key={emp.id} className="flex items-center gap-4 px-5 py-4 wf-live-row">
                                                                     <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center text-white text-sm font-bold flex-shrink-0">
@@ -3509,12 +3500,17 @@
                                                                         {emp.clockedIn ? (
                                                                             <div className="flex items-center gap-3 mt-0.5 flex-wrap">
                                                                                 <span className="text-green-400 text-xs font-medium">
-                                                                                    {fmtDate(emp.clockInTime)} · {fmtTime(emp.clockInTime)}
+                                                                                    {TimeUtil.formatEmployeeDate(emp, emp.clockInTime)} · {TimeUtil.formatEmployeeTime(emp, emp.clockInTime)}
                                                                                 </span>
                                                                                 <span className="text-slate-500 text-xs">·</span>
-                                                                                <span className="text-amber-400 text-xs font-medium font-mono">
-                                                                                    {fmtElapsed(emp.clockInTime)} elapsed
+                                                                                <span className={`text-xs font-medium font-mono ${isStaleSession ? 'text-red-400' : 'text-amber-400'}`}>
+                                                                                    {TimeUtil.formatDuration(elapsedMins)} elapsed
                                                                                 </span>
+                                                                                {isStaleSession && (
+                                                                                    <span className="text-xs px-2 py-0.5 rounded-full bg-red-500/20 text-red-400 font-semibold">
+                                                                                        ⚠ Stale — likely missed clock-out
+                                                                                    </span>
+                                                                                )}
                                                                             </div>
                                                                         ) : (
                                                                             <div className="text-slate-500 text-xs mt-0.5">Not clocked in</div>
@@ -3570,7 +3566,10 @@
                                             const grandMins = filteredTotals.reduce((s,r)=>s+r.mins,0);
 
                                             const livePreview = editingSession ? (() => {
-                                                try { return recalcEntry(editSessionForm); } catch(e) { return null; }
+                                                try {
+                                                    const editEmp = employees.find(e => e.id === editingSession.empId);
+                                                    return recalcEntry(editSessionForm, editEmp);
+                                                } catch(e) { return null; }
                                             })() : null;
 
                                             return (
@@ -5681,7 +5680,7 @@ if (currentView === 'employeeDashboard') {
                                         Customer Service
                                     </a>
                                     <button
-                                        onClick={() => { handleClockOut(); handleEmployeeSignOut(); }}
+                                        onClick={handleEmployeeSignOut}
                                         className="flex items-center gap-2 px-4 py-2 bg-red-600/80 hover:bg-red-600 text-white rounded-lg transition-all font-semibold"
                                     >
                                         <LogOut size={18} />
@@ -5704,23 +5703,20 @@ if (currentView === 'employeeDashboard') {
                             {/* ── MY SHIFTS VIEW ── */}
                             {employeeView === 'shifts' && (() => {
                                 const emp = currentEmployee;
-                                const history = (emp.workHistory || []).slice().sort((a,b) => new Date(b.date) - new Date(a.date));
-                                const fmtDate = (iso) => {
-                                    if (!iso) return '';
-                                    const d = new Date(iso);
-                                    return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-                                };
-                                const fmtTime = (iso) => {
-                                    if (!iso) return '--';
-                                    const d = new Date(iso);
-                                    const h = d.getHours(), m = String(d.getMinutes()).padStart(2,'0');
-                                    return `${h%12||12}:${m} ${h>=12?'PM':'AM'}`;
-                                };
-                                const fmtDur = (mins) => {
-                                    if (!mins && mins !== 0) return '--';
-                                    const h = Math.floor(mins/60), m = Math.round(mins%60);
-                                    return h > 0 ? `${h}h ${m}m` : `${m}m`;
-                                };
+                                // Dedupe by clockIn timestamp to suppress any duplicate auto-out entries
+                                const seen = new Set();
+                                const history = (emp.workHistory || [])
+                                    .filter(e => {
+                                        const k = (e.clockIn || '') + '_' + (e.clockOut || '');
+                                        if (seen.has(k)) return false;
+                                        seen.add(k);
+                                        return true;
+                                    })
+                                    .slice().sort((a,b) => new Date(b.date) - new Date(a.date));
+                                // Display in EMPLOYEE's timezone via TimeUtil
+                                const fmtDate = (iso) => TimeUtil.formatEmployeeDate(emp, iso);
+                                const fmtTime = (iso) => TimeUtil.formatEmployeeTime(emp, iso);
+                                const fmtDur  = (mins) => TimeUtil.formatDuration(mins);
                                 const now = new Date();
                                 const totalMonthMins = history.filter(e => {
                                     const d = new Date(e.date);
@@ -5769,49 +5765,42 @@ if (currentView === 'employeeDashboard') {
                             {(() => {
                                 const emp = currentEmployee;
                                 if (!emp) return null;
+                                // If not clocked in, show a "Clock In" card instead of the running shift card.
+                                // This handles the case where the owner force-clocked them out and they need
+                                // to clock back in for a new shift.
+                                if (!emp.clockedIn) {
+                                    return (
+                                        <div className="mb-6 bg-slate-800/50 backdrop-blur-xl border border-slate-700/50 rounded-2xl p-6 text-center">
+                                            <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-slate-700/50 mb-3">
+                                                <Clock size={22} className="text-slate-400" />
+                                            </div>
+                                            <h3 className="text-white text-lg font-bold mb-1">Not clocked in</h3>
+                                            <p className="text-slate-400 text-sm mb-4">
+                                                {emp.schedule?.openingTime && emp.schedule?.closingTime
+                                                    ? `Your shift: ${TimeUtil.format12h(emp.schedule.openingTime)} – ${TimeUtil.format12h(emp.schedule.closingTime)}`
+                                                    : 'Click below to start your shift'}
+                                            </p>
+                                            <button
+                                                onClick={handleClockIn}
+                                                className="px-6 py-2.5 bg-green-600 hover:bg-green-500 text-white rounded-lg font-semibold transition-all"
+                                            >
+                                                Clock In
+                                            </button>
+                                        </div>
+                                    );
+                                }
                                 // Card always renders when emp exists — clockedIn may be briefly false on first render
 
                                 // clockTick drives the 1-second re-render — do not remove
                                 void clockTick;
 
                                 const now = new Date();
-                                const tz = emp.schedule?.timezone || 'America/Toronto';
-                                const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(now);
-
-                                // Shift window
-                                const getShiftUTC = (timeStr) => {
-                                    if (!timeStr) return null;
-                                    const [h, m] = timeStr.split(':').map(Number);
-                                    const local = new Date(`${todayStr}T${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:00`);
-                                    const tzOff = new Date(now.toLocaleString('en-US',{timeZone:tz})) - new Date(now.toLocaleString('en-US',{timeZone:'UTC'}));
-                                    return new Date(local.getTime() - tzOff);
-                                };
-                                const shiftStartUTC = getShiftUTC(emp.schedule?.openingTime);
-                                const shiftEndUTC   = getShiftUTC(emp.schedule?.closingTime);
-
                                 // Live elapsed + earned (updates every second via clockTick)
-                                const grossMin  = emp.clockedIn && emp.clockInTime ? (now - new Date(emp.clockInTime)) / 60000 : 0;
-                                const paidMin   = Math.max(0, grossMin - (emp.assignedBreakMinutes || 0));
-
-
-                                // Convert HH:MM (24h) to 12h format
-                                const fmt12 = (t) => {
-                                    if (!t) return '';
-                                    const [h, m] = t.split(':').map(Number);
-                                    const ampm = h >= 12 ? 'PM' : 'AM';
-                                    const h12 = h % 12 || 12;
-                                    return `${h12}:${String(m).padStart(2,'0')} ${ampm}`;
-                                };
-
-                                const fmtT = (iso) => {
-                                    if (!iso) return '--:--';
-                                    const d = new Date(iso);
-                                    const h = d.getHours();
-                                    const m = String(d.getMinutes()).padStart(2,'0');
-                                    const ampm = h >= 12 ? 'PM' : 'AM';
-                                    const h12 = h % 12 || 12;
-                                    return `${h12}:${m} ${ampm}`;
-                                };
+                                const grossMin = emp.clockedIn && emp.clockInTime ? TimeUtil.minutesBetween(emp.clockInTime, now.toISOString()) : 0;
+                                const paidMin  = Math.max(0, grossMin - (emp.assignedBreakMinutes || 0));
+                                // Display formatters route through TimeUtil so times render in employee TZ
+                                const fmt12 = (t) => TimeUtil.format12h(t);
+                                const fmtT  = (iso) => TimeUtil.formatEmployeeTime(emp, iso);
 
                                 return (
                                     <div className="mb-6">
