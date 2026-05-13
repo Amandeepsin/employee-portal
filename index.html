@@ -2504,6 +2504,7 @@
                         tasksAssignedToOwner: [],
                         alertsEnabled: false,
                         alertRecipients: 'owner',
+                        hourlyRate: 0,
                         };
                     setEmployees([...employees, employee]);
                     setNewEmployee({ username: '', password: '', name: '', phone: '', email: '', idDocument: null });
@@ -3887,6 +3888,7 @@
                                                                                 closingTime: editFormData.closingTime,
                                                                                 timezone: editFormData.timezone
                                                                             },
+                                                                            hourlyRate: parseFloat(editFormData.hourlyRate) || 0,
                                                                             alertsEnabled: !!editFormData.alertsEnabled,
                                                                             alertRecipients: editFormData.alertRecipients || 'owner'
                                                                         })}
@@ -3991,6 +3993,18 @@
                                                                             />
                                                                         </div>
                                                                         <div>
+                                                                            <label className="text-slate-400 text-xs mb-1 block">Hourly Rate ($)</label>
+                                                                            <input
+                                                                                type="number"
+                                                                                min="0"
+                                                                                step="0.01"
+                                                                                value={editFormData.hourlyRate ?? ''}
+                                                                                onChange={(e) => setEditFormData({...editFormData, hourlyRate: e.target.value})}
+                                                                                placeholder="0.00"
+                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
+                                                                            />
+                                                                        </div>
+                                                                        <div>
                                                                             <label className="text-slate-400 text-xs mb-1 block">Timezone</label>
                                                                             <select
                                                                                 value={editFormData.timezone || 'America/Toronto'}
@@ -4089,6 +4103,12 @@
                                                                     </span>
                                                                 </span>
                                                                 <span className="text-slate-400 w-full">
+                                                                    Hourly Rate: 
+                                                                    <span className={`font-medium ml-2 ${employee.hourlyRate > 0 ? 'text-emerald-400' : 'text-slate-500'}`}>
+                                                                        {employee.hourlyRate > 0 ? '$' + Number(employee.hourlyRate).toFixed(2) + '/hr' : 'Not set'}
+                                                                    </span>
+                                                                </span>
+                                                                <span className="text-slate-400 w-full">
                                                                     Late Alerts: 
                                                                     <span className={`font-medium ml-2 ${employee.alertsEnabled ? 'text-amber-400' : 'text-slate-500'}`}>
                                                                         {employee.alertsEnabled ? '🔔 ON' : 'Off'}
@@ -4149,6 +4169,7 @@
                                                                         openingTime: employee.schedule?.openingTime || '09:00',
                                                                         closingTime: employee.schedule?.closingTime || '17:00',
                                                                         timezone: employee.schedule?.timezone || 'America/Toronto',
+                                                                        hourlyRate: employee.hourlyRate ?? 0,
                                                                         alertsEnabled: !!employee.alertsEnabled,
                                                                         alertRecipients: employee.alertRecipients || 'owner'
                                                                     });
