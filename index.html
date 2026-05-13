@@ -7,6 +7,8 @@
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.0/jspdf.plugin.autotable.min.js"></script>
     <style>
         /* ══════════════════════════════════
            WORKFLOW THEME SYSTEM
@@ -216,18 +218,6 @@
             }
             .wf-table-wrap table {
                 min-width: 520px !important;
-            }
-
-            /* ── CLOCK CARD ── */
-            .wf-clock-card-stats {
-                grid-template-columns: 1fr !important;
-            }
-            .wf-clock-card-stats > div {
-                border-right: none !important;
-                border-bottom: 0.5px solid rgba(100,116,139,0.3) !important;
-            }
-            .wf-clock-card-stats > div:last-child {
-                border-bottom: none !important;
             }
 
             /* ── BUTTONS ── */
@@ -547,22 +537,7 @@
                 'customerCallLogs'
             ],
 
-            // Per-day localStorage keys that pile up (autoClockOut_<id>_<date>, lateAlert_<id>_<date>)
-            // — older than 60 days are deleted to prevent unbounded growth.
-            cleanupOldDayKeys: () => {
-                try {
-                    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 60);
-                    const cutoffStr = cutoff.toISOString().split('T')[0];
-                    const toRemove = [];
-                    for (let i = 0; i < localStorage.length; i++) {
-                        const k = localStorage.key(i);
-                        if (!k) continue;
-                        const m = k.match(/^(autoClockOut|lateAlert)_\d+_(\d{4}-\d{2}-\d{2})$/);
-                        if (m && m[2] < cutoffStr) toRemove.push(k);
-                    }
-                    toRemove.forEach(k => localStorage.removeItem(k));
-                } catch(_) {}
-            },
+            cleanupOldDayKeys: () => {},
 
             getLastCleared: () => {
                 const stored = localStorage.getItem(CacheManager.CACHE_KEY);
@@ -731,11 +706,6 @@
                         const employees = [];
                         snapshot.forEach(doc => {
                             const d = { ...doc.data(), id: doc.id };
-                            // Migrate legacy fields
-                            if (d.clockedIn === undefined) d.clockedIn = false;
-                            if (d.workHistory === undefined) d.workHistory = [];
-                            if (d.isHourly === undefined) d.isHourly = false;
-                            if (d.hourlyRate === undefined) d.hourlyRate = 0;
                             employees.push(d);
                         });
                         
@@ -877,196 +847,908 @@
             }
         };
 
-        const App = () => {
-            // ════════════════════════════════════════════════════════════════
-            // TIMEUTIL — single source of truth for all date/time/timezone logic
-            // ════════════════════════════════════════════════════════════════
-            // Every clock-in, clock-out, edit, display, filter, and retroactive close
-            // routes through this module. Times are stored as UTC ISO strings;
-            // every display and parsing operation uses the EMPLOYEE's timezone,
-            // never the browser's local time.
-            const TimeUtil = {
-                // Default timezone fallback if employee has none configured
-                defaultTZ: 'America/Toronto',
+        // ════════════════════════════════════════════════════════════════
+        // WORK HISTORY VIEW COMPONENT
+        // Shows shifts for a selected employee in a date range,
+        // with bulk-delete and PDF pay-slip export.
+        // ════════════════════════════════════════════════════════════════
+        const WorkHistoryView = ({ employees, setEmployees, useFirebase, db }) => {
+            const [employeeId, setEmployeeId] = useState(null);
+            const [fromDate, setFromDate] = useState(() => {
+                const d = new Date();
+                d.setDate(d.getDate() - 14);
+                return d.toISOString().slice(0, 10);
+            });
+            const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
+            const [selectedIds, setSelectedIds] = useState([]);
 
-                tzFor: (emp) => emp?.schedule?.timezone || TimeUtil.defaultTZ,
+            // Editing state:
+            //   editingShiftId: id of shift currently being edited (or null)
+            //   addingForDate:  ISO date of absent day where user clicked + (or null)
+            //   editIn / editOut: HH:MM strings being edited
+            //   savingEdit: lock to prevent double-saves
+            const [editingShiftId, setEditingShiftId] = useState(null);
+            const [addingForDate, setAddingForDate] = useState(null);
+            const [editIn, setEditIn] = useState('');
+            const [editOut, setEditOut] = useState('');
+            const [savingEdit, setSavingEdit] = useState(false);
+            const [photoModalShift, setPhotoModalShift] = useState(null); // shift object or null
 
-                // Convert a local date+time in a specific IANA timezone to a UTC Date.
-                // DST-safe — uses Intl.DateTimeFormat to find the true offset,
-                // unlike the toLocaleString subtraction hack which breaks on DST.
-                parseInTZ: (dateStr, timeStr, tz) => {
-                    if (!dateStr || !timeStr) return null;
-                    const [year, month, day] = dateStr.split('-').map(Number);
-                    const [hour, minute]     = timeStr.split(':').map(Number);
-                    const approx = new Date(Date.UTC(year, month - 1, day, hour, minute));
-                    const parts = new Intl.DateTimeFormat('en-CA', {
-                        timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
-                        hour:'2-digit', minute:'2-digit', hour12: false
-                    }).formatToParts(approx);
-                    const get = (t) => parseInt(parts.find(p => p.type === t)?.value || '0');
-                    const drift = (hour - get('hour'))*3600000 + (minute - get('minute'))*60000 + (day - get('day'))*86400000;
-                    return new Date(approx.getTime() + drift);
-                },
+            const selectedEmp = employees.find(e => String(e.id) === String(employeeId));
+            const allShifts = (selectedEmp && selectedEmp.workHistory) || [];
 
-                // Parse a clock-in/out for an employee — uses the employee's timezone
-                parseEmployeeTime: (emp, dateStr, timeStr) =>
-                    TimeUtil.parseInTZ(dateStr, timeStr, TimeUtil.tzFor(emp)),
+            const fromTs = fromDate ? new Date(fromDate + 'T00:00:00').getTime() : 0;
+            const toTs   = toDate   ? new Date(toDate   + 'T23:59:59').getTime() : Date.now();
+            const filteredShifts = allShifts.filter(s => {
+                const t = new Date(s.clockIn || s.date).getTime();
+                return t >= fromTs && t <= toTs;
+            });
 
-                // Today's date string (YYYY-MM-DD) in the employee's timezone
-                todayInEmployeeTZ: (emp) =>
-                    new Intl.DateTimeFormat('en-CA', { timeZone: TimeUtil.tzFor(emp) }).format(new Date()),
-
-                // Get the date string of an ISO timestamp in the employee's timezone
-                dateInEmployeeTZ: (emp, iso) => {
-                    if (!iso) return '';
-                    return new Intl.DateTimeFormat('en-CA', { timeZone: TimeUtil.tzFor(emp) }).format(new Date(iso));
-                },
-
-                // Format an ISO timestamp as a 12-hour time in the employee's timezone (e.g. "9:30 AM")
-                formatEmployeeTime: (emp, iso) => {
-                    if (!iso) return '--:--';
-                    const tz = TimeUtil.tzFor(emp);
-                    const parts = new Intl.DateTimeFormat('en-US', {
-                        timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true
-                    }).formatToParts(new Date(iso));
-                    const h = parts.find(p => p.type === 'hour')?.value || '12';
-                    const m = parts.find(p => p.type === 'minute')?.value || '00';
-                    const a = parts.find(p => p.type === 'dayPeriod')?.value || 'AM';
-                    return `${h}:${m} ${a}`;
-                },
-
-                // Format an ISO timestamp as a date in the employee's timezone (e.g. "Mon, Nov 9")
-                formatEmployeeDate: (emp, iso) => {
-                    if (!iso) return '';
-                    return new Intl.DateTimeFormat('en-US', {
-                        timeZone: TimeUtil.tzFor(emp), weekday: 'short', month: 'short', day: 'numeric'
-                    }).format(new Date(iso));
-                },
-
-                // Format HH:MM (24h) string as 12h display (e.g. "09:00" -> "9:00 AM")
-                format12h: (timeStr) => {
-                    if (!timeStr) return '';
-                    const [h, m] = timeStr.split(':').map(Number);
-                    const ampm = h >= 12 ? 'PM' : 'AM';
-                    return `${h % 12 || 12}:${String(m).padStart(2,'0')} ${ampm}`;
-                },
-
-                // Format HH:MM input fields — extract hour/minute in employee TZ from ISO
-                isoToFormFields: (emp, iso) => {
-                    if (!iso) return { date: '', time: '' };
-                    const tz = TimeUtil.tzFor(emp);
-                    const parts = new Intl.DateTimeFormat('en-CA', {
-                        timeZone: tz, year:'numeric', month:'2-digit', day:'2-digit',
-                        hour:'2-digit', minute:'2-digit', hour12: false
-                    }).formatToParts(new Date(iso));
-                    const g = (t) => parts.find(p => p.type === t)?.value || '00';
-                    return { date: `${g('year')}-${g('month')}-${g('day')}`, time: `${g('hour')}:${g('minute')}` };
-                },
-
-                // Minutes between two ISO timestamps
-                minutesBetween: (isoA, isoB) => Math.max(0, (new Date(isoB) - new Date(isoA)) / 60000),
-
-                // Format a duration in minutes as a string (e.g. "8h 30m" or "45m")
-                formatDuration: (mins) => {
-                    if (mins == null) return '--';
-                    const h = Math.floor(mins / 60), m = Math.round(mins % 60);
-                    return h > 0 ? `${h}h ${m}m` : `${m}m`;
-                },
-
-                // Compute lateness for clock-in `now` against scheduled start time
-                // Returns { minutesLate, isLate }. Caps at 720 min (12 h) so off-hours
-                // logins or weekend logins don't show as massively late.
-                computeLateness: (emp, now) => {
-                    if (!emp?.schedule?.openingTime) return { minutesLate: 0, isLate: false };
-                    const today  = TimeUtil.todayInEmployeeTZ(emp);
-                    const shiftUTC = TimeUtil.parseEmployeeTime(emp, today, emp.schedule.openingTime);
-                    if (!shiftUTC) return { minutesLate: 0, isLate: false };
-                    let minutesLate = Math.max(0, Math.round((now - shiftUTC) / 60000));
-                    if (minutesLate > 720) minutesLate = 0; // Off-hours / wrong-day login
-                    return { minutesLate, isLate: minutesLate > 0 };
-                }
+            // Build a day-by-day list across the date range.
+            // Each row is either a worked shift or an 'absent' placeholder.
+            // YYYY-MM-DD key keeps things tz-stable.
+            const dateKey = (iso) => {
+                const d = new Date(iso);
+                const y = d.getFullYear();
+                const m = String(d.getMonth() + 1).padStart(2, '0');
+                const day = String(d.getDate()).padStart(2, '0');
+                return y + '-' + m + '-' + day;
             };
 
-            // ════════════════════════════════════════════════════════════════
-            // ShiftRecorder — single source of truth for closing a shift
-            // ════════════════════════════════════════════════════════════════
-            // Every clock-out path (manual, force, auto, retroactive, sign-out, tab-close)
-            // routes through buildShiftEntry / closeShift. This guarantees:
-            //   - paid time, gross time, and pay are computed identically
-            //   - duplicate entries are deduplicated by clockIn timestamp
-            //   - assignedBreakMinutes is reset for the next shift
-            //   - isLateToday / minutesLate are reset
-            const ShiftRecorder = {
-                // Build a workHistory entry from raw inputs.
-                // `extra` lets callers tag the entry (autoClockOut, forcedByOwner, missedClockOut, closedTab).
-                buildEntry: (emp, clockInISO, clockOutISO, breakMin, extra = {}) => {
-                    const grossMin = TimeUtil.minutesBetween(clockInISO, clockOutISO);
-                    const paidMin  = Math.max(0, grossMin - (breakMin || 0));
-                    const paidHours= parseFloat((paidMin / 60).toFixed(2));
-                    const rate     = emp?.hourlyRate || 0;
-                    const pay      = parseFloat((paidHours * rate).toFixed(2));
-                    return {
-                        id: Date.now() + Math.random(),
-                        date: clockOutISO, // FIX: use clock-out date so date filters land correctly
-                        clockIn: clockInISO,
-                        clockOut: clockOutISO,
-                        grossMinutes: Math.round(grossMin),
-                        breakMinutes: breakMin || 0,
-                        paidMinutes: Math.round(paidMin),
-                        paidHours, hourlyRate: rate, pay,
-                        wasLate: emp?.isLateToday || false,
-                        minutesLate: emp?.minutesLate || 0,
-                        ...extra
-                    };
-                },
+            // Map worked dates → shift (handles multiple shifts in one day by keeping all)
+            const shiftsByDate = {};
+            filteredShifts.forEach(s => {
+                const key = dateKey(s.clockIn || s.date);
+                if (!shiftsByDate[key]) shiftsByDate[key] = [];
+                shiftsByDate[key].push(s);
+            });
 
-                // Close a shift — returns the updated employee object.
-                // Dedupes on clockIn so we never write a second entry for the same shift.
-                closeShift: (emp, clockOutISO, extra = {}) => {
-                    if (!emp.clockedIn || !emp.clockInTime) return emp; // nothing to close
-                    const breakMin = emp.assignedBreakMinutes || 0;
-                    // Dedup: if we already have a closed entry for this clockIn, just clear the flag
-                    const normTS = (s) => s ? new Date(s).getTime() : 0;
-                    const alreadyClosed = (emp.workHistory || []).some(e =>
-                        normTS(e.clockIn) === normTS(emp.clockInTime) && e.clockOut
-                    );
-                    if (alreadyClosed) {
-                        return {
-                            ...emp,
-                            clockedIn: false,
-                            clockOutTime: clockOutISO,
-                            isLateToday: false,
-                            minutesLate: 0,
-                            assignedBreakMinutes: 0
-                        };
+            // Walk every date in [fromDate, toDate]
+            const dayEntries = [];
+            if (selectedEmp && fromDate && toDate) {
+                const start = new Date(fromDate + 'T00:00:00');
+                const end = new Date(toDate + 'T00:00:00');
+                const today = new Date();
+                today.setHours(23, 59, 59, 999);
+                for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                    const key = dateKey(d);
+                    if (shiftsByDate[key]) {
+                        // Push every shift for the day (may be multiple)
+                        shiftsByDate[key].forEach(s => dayEntries.push({ type: 'shift', date: d.toISOString(), shift: s }));
+                    } else if (d <= today) {
+                        // No shift this day, and the day has passed → absent
+                        dayEntries.push({ type: 'absent', date: d.toISOString() });
                     }
-                    const entry = ShiftRecorder.buildEntry(emp, emp.clockInTime, clockOutISO, breakMin, extra);
-                    return {
-                        ...emp,
-                        clockedIn: false,
-                        clockOutTime: clockOutISO,
-                        workHistory: [...(emp.workHistory || []), entry],
-                        isLateToday: false,
-                        minutesLate: 0,
-                        assignedBreakMinutes: 0 // Reset for next shift
-                    };
-                },
+                    // Future dates with no shift: skip entirely (not "absent yet")
+                }
+                // Reverse so newest is on top
+                dayEntries.reverse();
+            }
 
-                // Open a new shift — sets clockedIn:true, computes lateness, sets clockInTime to now
-                openShift: (emp, now = new Date()) => {
-                    const { minutesLate, isLate } = TimeUtil.computeLateness(emp, now);
-                    return {
-                        ...emp,
-                        clockedIn: true,
-                        clockInTime: now.toISOString(),
-                        isLateToday: isLate,
-                        minutesLate
-                    };
+            const totalMinutes = filteredShifts.reduce((sum, s) => sum + (s.paidMinutes || s.grossMinutes || 0), 0);
+            const totalMinutesRounded = Math.round(totalMinutes);
+            const totalHours = Math.floor(totalMinutesRounded / 60) + 'h ' + (totalMinutesRounded % 60) + 'm';
+            const totalPay = filteredShifts.reduce((sum, s) => sum + (s.pay || 0), 0).toFixed(2);
+            const absentCount = dayEntries.filter(d => d.type === 'absent').length;
+
+            const fmtDuration = (mins) => {
+                if (!mins) return '0h';
+                const h = Math.floor(mins / 60);
+                const m = Math.round(mins % 60);
+                return h > 0 ? (h + 'h ' + m + 'm') : (m + 'm');
+            };
+            const fmtTime = (iso) => {
+                if (!iso) return '—';
+                return new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            };
+            const fmtDate = (iso) => {
+                if (!iso) return '—';
+                return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: '2-digit' });
+            };
+
+            const toggleSelect = (shiftId) => {
+                setSelectedIds(prev =>
+                    prev.includes(shiftId) ? prev.filter(id => id !== shiftId) : [...prev, shiftId]
+                );
+            };
+            const toggleSelectAll = () => {
+                if (selectedIds.length === filteredShifts.length) {
+                    setSelectedIds([]);
+                } else {
+                    setSelectedIds(filteredShifts.map(s => s.id));
                 }
             };
 
+            const deleteSelected = async () => {
+                if (!selectedEmp || selectedIds.length === 0) return;
+                if (!confirm('Delete ' + selectedIds.length + ' shift record(s)? This cannot be undone.')) return;
+                const remaining = (selectedEmp.workHistory || []).filter(s => !selectedIds.includes(s.id));
+                const updated = { ...selectedEmp, workHistory: remaining };
+                setEmployees(employees.map(e => e.id === selectedEmp.id ? updated : e));
+                if (useFirebase && db) {
+                    try {
+                        await db.collection('employees').doc(selectedEmp.id.toString()).update({ workHistory: remaining });
+                    } catch (err) {
+                        console.error('Failed to delete shifts from Firebase:', err);
+                        alert('Saved locally but failed to sync to Firebase.');
+                    }
+                } else if (Storage) {
+                    Storage.saveEmployees(employees.map(e => e.id === selectedEmp.id ? updated : e));
+                }
+                setSelectedIds([]);
+            };
+
+            // ── EDIT FLOW ──
+            // Open the inline editor for an existing shift.
+            const startEditShift = (shift) => {
+                setAddingForDate(null);
+                setEditingShiftId(shift.id);
+                const toHM = (iso) => {
+                    if (!iso) return '';
+                    const d = new Date(iso);
+                    return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+                };
+                setEditIn(toHM(shift.clockIn));
+                setEditOut(toHM(shift.clockOut));
+            };
+            // Open the inline editor to create a shift on an absent day.
+            const startAddShift = (isoDate) => {
+                setEditingShiftId(null);
+                setAddingForDate(isoDate);
+                // Pre-fill with employee's scheduled hours if available.
+                const open = selectedEmp?.schedule?.openingTime || '';
+                const close = selectedEmp?.schedule?.closingTime || '';
+                setEditIn(open);
+                setEditOut(close);
+            };
+            const cancelEdit = () => {
+                setEditingShiftId(null);
+                setAddingForDate(null);
+                setEditIn('');
+                setEditOut('');
+            };
+
+            // Build a JS Date from a YYYY-MM-DD anchor + HH:MM time string.
+            const buildShiftDate = (anchorIso, hhmm) => {
+                if (!hhmm || !hhmm.includes(':')) return null;
+                const [h, m] = hhmm.split(':').map(Number);
+                const d = new Date(anchorIso);
+                d.setHours(h, m, 0, 0);
+                return d;
+            };
+
+            // Save the current edit (works for both new and existing shifts).
+            const saveEdit = async () => {
+                if (!selectedEmp || !editIn || !editOut) {
+                    alert('Both clock-in and clock-out times are required.');
+                    return;
+                }
+                if (savingEdit) return;
+                setSavingEdit(true);
+                try {
+                    let newHistory;
+                    if (editingShiftId !== null) {
+                        // EDIT EXISTING
+                        const orig = (selectedEmp.workHistory || []).find(s => s.id === editingShiftId);
+                        if (!orig) { setSavingEdit(false); return; }
+                        const anchor = orig.clockIn || orig.date;
+                        const inDate  = buildShiftDate(anchor, editIn);
+                        let outDate   = buildShiftDate(anchor, editOut);
+                        if (!inDate || !outDate) { alert('Invalid time.'); setSavingEdit(false); return; }
+                        // Handle overnight shift: if out is before in, push out by 1 day.
+                        if (outDate <= inDate) outDate.setDate(outDate.getDate() + 1);
+                        const grossMin = (outDate - inDate) / 60000;
+                        const paidHours = parseFloat((grossMin / 60).toFixed(2));
+                        const rate = orig.hourlyRate || selectedEmp.hourlyRate || 0;
+                        const pay = parseFloat((paidHours * rate).toFixed(2));
+                        const updatedShift = {
+                            ...orig,
+                            clockIn: inDate.toISOString(),
+                            clockOut: outDate.toISOString(),
+                            grossMinutes: Math.round(grossMin),
+                            paidMinutes: Math.round(grossMin),
+                            paidHours,
+                            hourlyRate: rate,
+                            pay,
+                            editedAt: new Date().toISOString()
+                        };
+                        newHistory = (selectedEmp.workHistory || []).map(s => s.id === editingShiftId ? updatedShift : s);
+                    } else if (addingForDate) {
+                        // ADD NEW from absent
+                        const inDate  = buildShiftDate(addingForDate, editIn);
+                        let outDate   = buildShiftDate(addingForDate, editOut);
+                        if (!inDate || !outDate) { alert('Invalid time.'); setSavingEdit(false); return; }
+                        if (outDate <= inDate) outDate.setDate(outDate.getDate() + 1);
+                        const grossMin = (outDate - inDate) / 60000;
+                        const paidHours = parseFloat((grossMin / 60).toFixed(2));
+                        const rate = selectedEmp.hourlyRate || 0;
+                        const pay = parseFloat((paidHours * rate).toFixed(2));
+                        const newShift = {
+                            id: Date.now() + Math.random(),
+                            date: inDate.toISOString(),
+                            clockIn: inDate.toISOString(),
+                            clockOut: outDate.toISOString(),
+                            grossMinutes: Math.round(grossMin),
+                            paidMinutes: Math.round(grossMin),
+                            paidHours,
+                            hourlyRate: rate,
+                            pay,
+                            wasLate: false,
+                            minutesLate: 0,
+                            manualEntry: true,
+                            createdAt: new Date().toISOString()
+                        };
+                        newHistory = [...(selectedEmp.workHistory || []), newShift];
+                    } else {
+                        setSavingEdit(false);
+                        return;
+                    }
+
+                    const updatedEmp = { ...selectedEmp, workHistory: newHistory };
+                    setEmployees(employees.map(e => e.id === selectedEmp.id ? updatedEmp : e));
+                    if (useFirebase && db) {
+                        await db.collection('employees').doc(selectedEmp.id.toString()).update({ workHistory: newHistory });
+                    } else if (typeof Storage !== 'undefined' && Storage.saveEmployees) {
+                        Storage.saveEmployees(employees.map(e => e.id === selectedEmp.id ? updatedEmp : e));
+                    }
+                    cancelEdit();
+                } catch (err) {
+                    console.error('Failed to save shift:', err);
+                    alert('Failed to save. Check console for details.');
+                } finally {
+                    setSavingEdit(false);
+                }
+            };
+
+            const exportPDF = () => {
+                if (!selectedEmp || dayEntries.length === 0) return;
+                if (!window.jspdf) { alert('PDF library not loaded yet. Try again.'); return; }
+                const { jsPDF } = window.jspdf;
+                const doc = new jsPDF();
+
+                doc.setFontSize(18);
+                doc.setFont('helvetica', 'bold');
+                doc.text('Pay Slip', 14, 20);
+
+                doc.setFontSize(10);
+                doc.setFont('helvetica', 'normal');
+                doc.setTextColor(100);
+                doc.text('Generated: ' + new Date().toLocaleString(), 14, 27);
+
+                doc.setFontSize(11);
+                doc.setTextColor(0);
+                doc.setFont('helvetica', 'bold');
+                doc.text('Employee:', 14, 40);
+                doc.setFont('helvetica', 'normal');
+                doc.text(selectedEmp.name, 45, 40);
+
+                doc.setFont('helvetica', 'bold');
+                doc.text('Period:', 14, 47);
+                doc.setFont('helvetica', 'normal');
+                doc.text(fromDate + '  to  ' + toDate, 45, 47);
+
+                doc.setFont('helvetica', 'bold');
+                doc.text('Total Shifts:', 14, 54);
+                doc.setFont('helvetica', 'normal');
+                doc.text(String(filteredShifts.length), 45, 54);
+
+                doc.setFont('helvetica', 'bold');
+                doc.text('Total Hours:', 14, 61);
+                doc.setFont('helvetica', 'normal');
+                doc.text(totalHours, 45, 61);
+
+                doc.setFont('helvetica', 'bold');
+                doc.text('Days Absent:', 14, 68);
+                doc.setFont('helvetica', 'normal');
+                doc.text(String(absentCount), 45, 68);
+
+                let nextY = 75;
+                if (parseFloat(totalPay) > 0) {
+                    doc.setFont('helvetica', 'bold');
+                    doc.text('Total Pay:', 14, nextY);
+                    doc.setFont('helvetica', 'normal');
+                    doc.text('$' + totalPay, 45, nextY);
+                    nextY += 7;
+                }
+
+                doc.autoTable({
+                    startY: nextY + 3,
+                    head: [['Date', 'Clock In', 'Clock Out', 'Duration']],
+                    body: dayEntries.map(entry => {
+                        if (entry.type === 'shift') {
+                            const s = entry.shift;
+                            return [
+                                fmtDate(s.clockIn || s.date),
+                                fmtTime(s.clockIn),
+                                fmtTime(s.clockOut),
+                                fmtDuration(s.paidMinutes || s.grossMinutes || 0)
+                            ];
+                        } else {
+                            return [
+                                fmtDate(entry.date),
+                                { content: 'ABSENT', colSpan: 2, styles: { textColor: [220, 38, 38], fontStyle: 'bold', halign: 'center' } },
+                                '—'
+                            ];
+                        }
+                    }),
+                    theme: 'striped',
+                    headStyles: { fillColor: [16, 185, 129], textColor: 255, fontStyle: 'bold' },
+                    styles: { fontSize: 9, cellPadding: 3 }
+                });
+
+                doc.save('payslip_' + selectedEmp.name.replace(/\s+/g, '_') + '_' + fromDate + '_to_' + toDate + '.pdf');
+            };
+
+            return (
+                <>
+                <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl p-6 border border-slate-700/50">
+                    <div className="flex items-center justify-between mb-6">
+                        <h2 className="text-2xl font-bold text-white flex items-center gap-2">
+                            <Clock className="text-emerald-500" />
+                            Work History
+                        </h2>
+                    </div>
+
+                    <div className="grid md:grid-cols-4 gap-3 mb-5">
+                        <div>
+                            <label className="text-slate-400 text-xs mb-1 block">Employee</label>
+                            <select
+                                value={employeeId || ''}
+                                onChange={(e) => {
+                                    setEmployeeId(e.target.value || null);
+                                    setSelectedIds([]);
+                                }}
+                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                            >
+                                <option value="">— Select employee —</option>
+                                {employees.map(e => (
+                                    <option key={e.id} value={e.id}>{e.name}</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-slate-400 text-xs mb-1 block">From</label>
+                            <input
+                                type="date"
+                                value={fromDate}
+                                onChange={(e) => setFromDate(e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                            />
+                        </div>
+                        <div>
+                            <label className="text-slate-400 text-xs mb-1 block">To</label>
+                            <input
+                                type="date"
+                                value={toDate}
+                                onChange={(e) => setToDate(e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                            />
+                        </div>
+                        <div className="flex items-end">
+                            <button
+                                onClick={exportPDF}
+                                disabled={!selectedEmp || dayEntries.length === 0}
+                                className="w-full px-4 py-2 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 disabled:from-slate-700 disabled:to-slate-700 disabled:cursor-not-allowed disabled:text-slate-500 text-white font-semibold rounded-lg transition-all text-sm flex items-center justify-center gap-2"
+                            >
+                                📄 Export Pay Slip PDF
+                            </button>
+                        </div>
+                    </div>
+
+                    {!selectedEmp ? (
+                        <div className="text-center py-12">
+                            <Clock size={48} className="mx-auto text-slate-600 mb-3" />
+                            <p className="text-slate-400">Select an employee to view their work history</p>
+                        </div>
+                    ) : dayEntries.length === 0 ? (
+                        <div className="text-center py-12">
+                            <p className="text-slate-400">No data for this date range</p>
+                            <p className="text-slate-500 text-xs mt-2">Try expanding the date range</p>
+                        </div>
+                    ) : (
+                        <>
+                            <div className="grid grid-cols-4 gap-3 mb-4">
+                                <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                    <div className="text-slate-400 text-xs">Total Shifts</div>
+                                    <div className="text-white text-2xl font-bold">{filteredShifts.length}</div>
+                                </div>
+                                <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                    <div className="text-slate-400 text-xs">Total Hours</div>
+                                    <div className="text-emerald-400 text-2xl font-bold">{totalHours}</div>
+                                </div>
+                                <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                    <div className="text-slate-400 text-xs">Total Pay</div>
+                                    <div className="text-emerald-400 text-2xl font-bold">${totalPay}</div>
+                                </div>
+                                <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                    <div className="text-slate-400 text-xs">Days Absent</div>
+                                    <div className={'text-2xl font-bold ' + (absentCount > 0 ? 'text-red-400' : 'text-slate-500')}>{absentCount}</div>
+                                </div>
+                            </div>
+
+                            {selectedIds.length > 0 && (
+                                <div className="flex items-center justify-between mb-3 bg-red-500/10 border border-red-500/30 px-4 py-2 rounded-lg">
+                                    <span className="text-red-300 text-sm">
+                                        {selectedIds.length} shift{selectedIds.length === 1 ? '' : 's'} selected
+                                    </span>
+                                    <div className="flex gap-2">
+                                        <button
+                                            onClick={() => setSelectedIds([])}
+                                            className="px-3 py-1 text-sm text-slate-300 hover:text-white"
+                                        >
+                                            Clear
+                                        </button>
+                                        <button
+                                            onClick={deleteSelected}
+                                            className="px-4 py-1 bg-red-600 hover:bg-red-500 text-white text-sm rounded-lg transition-colors"
+                                        >
+                                            Delete selected
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-sm">
+                                    <thead>
+                                        <tr className="border-b border-slate-700/50 text-slate-400 text-left text-xs uppercase tracking-wide">
+                                            <th className="py-2 pl-2 pr-1 w-8">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={selectedIds.length === filteredShifts.length && filteredShifts.length > 0}
+                                                    onChange={toggleSelectAll}
+                                                    className="accent-emerald-500"
+                                                />
+                                            </th>
+                                            <th className="py-2 px-2">Date</th>
+                                            <th className="py-2 px-2">Clock In</th>
+                                            <th className="py-2 px-2">Clock Out</th>
+                                            <th className="py-2 px-2 text-right">Duration</th>
+                                            <th className="py-2 px-2 text-right w-20"></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {dayEntries.map((entry, idx) => {
+                                            const isEditingThis = entry.type === 'shift' && editingShiftId === entry.shift.id;
+                                            const isAddingThis = entry.type === 'absent' && addingForDate === entry.date;
+                                            if (isEditingThis || isAddingThis) {
+                                                return (
+                                                    <tr key={'e_' + (isEditingThis ? entry.shift.id : entry.date)} className="border-b border-slate-700/30 bg-emerald-500/10">
+                                                        <td className="py-2 pl-2 pr-1"></td>
+                                                        <td className="py-2 px-2 text-slate-200">{fmtDate(isEditingThis ? (entry.shift.clockIn || entry.shift.date) : entry.date)}</td>
+                                                        <td className="py-2 px-2">
+                                                            <input
+                                                                type="time"
+                                                                value={editIn}
+                                                                onChange={(e) => setEditIn(e.target.value)}
+                                                                className="px-2 py-1 bg-slate-900/70 border border-slate-600 rounded text-white text-xs font-mono"
+                                                            />
+                                                        </td>
+                                                        <td className="py-2 px-2">
+                                                            <input
+                                                                type="time"
+                                                                value={editOut}
+                                                                onChange={(e) => setEditOut(e.target.value)}
+                                                                className="px-2 py-1 bg-slate-900/70 border border-slate-600 rounded text-white text-xs font-mono"
+                                                            />
+                                                        </td>
+                                                        <td className="py-2 px-2 text-right text-slate-500 text-xs">recalc on save</td>
+                                                        <td className="py-2 px-2 text-right whitespace-nowrap">
+                                                            <button
+                                                                onClick={saveEdit}
+                                                                disabled={savingEdit}
+                                                                className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs rounded mr-1"
+                                                            >
+                                                                {savingEdit ? '…' : 'Save'}
+                                                            </button>
+                                                            <button
+                                                                onClick={cancelEdit}
+                                                                disabled={savingEdit}
+                                                                className="px-2 py-1 bg-slate-700 hover:bg-slate-600 text-white text-xs rounded"
+                                                            >
+                                                                ✕
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            }
+                                            return entry.type === 'shift' ? (
+                                                <tr key={'s_' + entry.shift.id} className={'border-b border-slate-700/30 hover:bg-slate-700/20 ' + (selectedIds.includes(entry.shift.id) ? 'bg-emerald-500/5' : '')}>
+                                                    <td className="py-2 pl-2 pr-1">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={selectedIds.includes(entry.shift.id)}
+                                                            onChange={() => toggleSelect(entry.shift.id)}
+                                                            className="accent-emerald-500"
+                                                        />
+                                                    </td>
+                                                    <td className="py-2 px-2 text-slate-200">
+                                                        {fmtDate(entry.shift.clockIn || entry.shift.date)}
+                                                        {entry.shift.manualEntry && <span className="ml-2 px-1.5 py-0.5 bg-blue-500/20 text-blue-300 text-[10px] rounded">manual</span>}
+                                                        {entry.shift.editedAt && !entry.shift.manualEntry && <span className="ml-2 px-1.5 py-0.5 bg-amber-500/20 text-amber-300 text-[10px] rounded">edited</span>}
+                                                    </td>
+                                                    <td className="py-2 px-2 text-slate-300 font-mono text-xs">{fmtTime(entry.shift.clockIn)}</td>
+                                                    <td className="py-2 px-2 text-slate-300 font-mono text-xs">{fmtTime(entry.shift.clockOut)}</td>
+                                                    <td className="py-2 px-2 text-right text-emerald-400 font-semibold">{fmtDuration(entry.shift.paidMinutes || entry.shift.grossMinutes || 0)}</td>
+                                                    <td className="py-2 px-2 text-right whitespace-nowrap">
+                                                        {(entry.shift.clockInPhoto || entry.shift.clockOutPhoto || entry.shift.photoMissingIn || entry.shift.photoMissingOut) && (
+                                                            <button
+                                                                onClick={() => setPhotoModalShift(entry.shift)}
+                                                                className={'px-2 py-1 mr-1 text-xs rounded ' + ((entry.shift.photoMissingIn || entry.shift.photoMissingOut) ? 'bg-amber-700/40 hover:bg-amber-600 text-amber-200' : 'bg-slate-700/60 hover:bg-slate-600 text-slate-200')}
+                                                                title="View photos"
+                                                            >
+                                                                📷
+                                                            </button>
+                                                        )}
+                                                        <button
+                                                            onClick={() => startEditShift(entry.shift)}
+                                                            className="px-2 py-1 bg-slate-700/60 hover:bg-slate-600 text-slate-200 text-xs rounded"
+                                                            title="Edit times"
+                                                        >
+                                                            ✏️
+                                                        </button>
+                                                    </td>
+                                                </tr>
+                                            ) : (
+                                                <tr key={'a_' + entry.date} className="border-b border-slate-700/30 bg-red-500/5">
+                                                    <td className="py-2 pl-2 pr-1"></td>
+                                                    <td className="py-2 px-2 text-slate-400">{fmtDate(entry.date)}</td>
+                                                    <td colSpan="2" className="py-2 px-2 text-red-400 text-xs font-semibold uppercase tracking-wide">Absent</td>
+                                                    <td className="py-2 px-2 text-right text-slate-600">—</td>
+                                                    <td className="py-2 px-2 text-right">
+                                                        <button
+                                                            onClick={() => startAddShift(entry.date)}
+                                                            className="px-2 py-1 bg-emerald-700/50 hover:bg-emerald-600 text-emerald-200 text-xs rounded"
+                                                            title="Add shift for this day"
+                                                        >
+                                                            +
+                                                        </button>
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </>
+                    )}
+                </div>
+
+                {/* Photo viewer modal */}
+                {photoModalShift && (
+                    <div
+                        onClick={() => setPhotoModalShift(null)}
+                        className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+                    >
+                        <div
+                            onClick={(e) => e.stopPropagation()}
+                            className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-6 max-w-3xl w-full"
+                        >
+                            <div className="flex items-center justify-between mb-4">
+                                <h3 className="text-xl font-bold text-white">
+                                    Clock photos · {fmtDate(photoModalShift.clockIn || photoModalShift.date)}
+                                </h3>
+                                <button
+                                    onClick={() => setPhotoModalShift(null)}
+                                    className="text-slate-400 hover:text-white text-2xl leading-none"
+                                >
+                                    ✕
+                                </button>
+                            </div>
+                            <div className="grid md:grid-cols-2 gap-4">
+                                <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                    <div className="text-slate-400 text-xs uppercase tracking-wide mb-2">Clock In · {fmtTime(photoModalShift.clockIn)}</div>
+                                    {photoModalShift.clockInPhoto ? (
+                                        <img src={photoModalShift.clockInPhoto} alt="Clock-in" className="w-full rounded-lg" />
+                                    ) : photoModalShift.photoMissingIn ? (
+                                        <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-6 text-center text-amber-300 text-sm">
+                                            ⚠️ Camera failed at clock-in
+                                        </div>
+                                    ) : (
+                                        <div className="bg-slate-900/60 rounded-lg p-6 text-center text-slate-500 text-sm">
+                                            No photo
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                    <div className="text-slate-400 text-xs uppercase tracking-wide mb-2">Clock Out · {fmtTime(photoModalShift.clockOut)}</div>
+                                    {photoModalShift.clockOutPhoto ? (
+                                        <img src={photoModalShift.clockOutPhoto} alt="Clock-out" className="w-full rounded-lg" />
+                                    ) : photoModalShift.photoMissingOut ? (
+                                        <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-6 text-center text-amber-300 text-sm">
+                                            ⚠️ Camera failed at clock-out
+                                        </div>
+                                    ) : (
+                                        <div className="bg-slate-900/60 rounded-lg p-6 text-center text-slate-500 text-sm">
+                                            No photo
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+                </>
+            );
+        };
+
+        // ════════════════════════════════════════════════════════════════
+        // LIVE STATUS VIEW
+        // Shows employees currently clocked in. Updates in real time as
+        // the parent `employees` state changes (via Firebase listener).
+        // The elapsed-time counter ticks every 30 seconds.
+        // ════════════════════════════════════════════════════════════════
+        const LiveStatusView = ({ employees }) => {
+            // Re-render every second so the elapsed counter ticks live.
+            const [, setTick] = useState(0);
+            useEffect(() => {
+                const id = setInterval(() => setTick(t => t + 1), 1000);
+                return () => clearInterval(id);
+            }, []);
+
+            const clockedIn = (employees || [])
+                .filter(e => e.clockedIn && e.clockInTime)
+                .sort((a, b) => new Date(a.clockInTime) - new Date(b.clockInTime));
+
+            const fmtElapsed = (iso) => {
+                if (!iso) return '—';
+                const totalSec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+                const h = Math.floor(totalSec / 3600);
+                const m = Math.floor((totalSec % 3600) / 60);
+                const s = totalSec % 60;
+                const pad = n => String(n).padStart(2, '0');
+                return h + 'h ' + pad(m) + 'm ' + pad(s) + 's';
+            };
+            const fmtClockIn = (iso) => {
+                if (!iso) return '—';
+                return new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            };
+
+            // Compare against scheduled openingTime to flag late starts.
+            const lateBadge = (emp) => {
+                if (!emp.schedule?.openingTime || !emp.clockInTime) return null;
+                const [h, m] = emp.schedule.openingTime.split(':').map(Number);
+                const sched = new Date(emp.clockInTime);
+                sched.setHours(h, m, 0, 0);
+                const lateMins = Math.round((new Date(emp.clockInTime).getTime() - sched.getTime()) / 60000);
+                if (lateMins > 5) {
+                    const label = lateMins >= 60
+                        ? 'Late ' + Math.floor(lateMins / 60) + 'h ' + (lateMins % 60) + 'm'
+                        : 'Late ' + lateMins + 'm';
+                    return <span className="ml-2 px-2 py-0.5 bg-amber-500/20 text-amber-300 text-xs rounded">{label}</span>;
+                }
+                return null;
+            };
+
+            return (
+                <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl p-6 border border-slate-700/50">
+                    <div className="flex items-center justify-between mb-6">
+                        <h2 className="text-2xl font-bold text-white flex items-center gap-2">
+                            <span className="relative inline-flex">
+                                <span className="w-3 h-3 bg-green-500 rounded-full"></span>
+                                <span className="absolute inset-0 w-3 h-3 bg-green-500 rounded-full animate-ping opacity-75"></span>
+                            </span>
+                            Live Status
+                        </h2>
+                        <span className="text-slate-400 text-sm">
+                            {clockedIn.length} {clockedIn.length === 1 ? 'employee' : 'employees'} clocked in
+                        </span>
+                    </div>
+
+                    {clockedIn.length === 0 ? (
+                        <div className="text-center py-12">
+                            <Clock size={48} className="mx-auto text-slate-600 mb-3" />
+                            <p className="text-slate-400">No one is clocked in right now</p>
+                            <p className="text-slate-500 text-xs mt-2">This view updates automatically when someone clocks in</p>
+                        </div>
+                    ) : (
+                        <div className="space-y-3">
+                            {clockedIn.map(emp => (
+                                <div key={emp.id} className="bg-slate-900/40 border border-slate-700/50 rounded-lg p-4 flex items-center justify-between gap-4">
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex items-center flex-wrap gap-2">
+                                            <span className="text-white font-semibold text-lg">{emp.name}</span>
+                                            {lateBadge(emp)}
+                                        </div>
+                                        <div className="text-slate-400 text-xs mt-1 flex flex-wrap gap-x-4">
+                                            <span>Clocked in at <span className="text-slate-300 font-mono">{fmtClockIn(emp.clockInTime)}</span></span>
+                                            {emp.schedule?.openingTime && (
+                                                <span>Scheduled <span className="text-slate-300 font-mono">{emp.schedule.openingTime}–{emp.schedule.closingTime || '?'}</span></span>
+                                            )}
+                                            {emp.allowedIPs && emp.allowedIPs.length > 0 && (
+                                                <span>Location <span className="text-slate-300 font-mono">{emp.allowedIPs.join(', ')}</span></span>
+                                            )}
+                                        </div>
+                                    </div>
+                                    <div className="text-right flex-shrink-0">
+                                        <div className="text-emerald-400 text-2xl font-bold tabular-nums">{fmtElapsed(emp.clockInTime)}</div>
+                                        <div className="text-slate-500 text-xs">elapsed</div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // ════════════════════════════════════════════════════════════════
+        // MY WORK HISTORY VIEW (employee-facing)
+        // Read-only. No pay, no photos, no edit/delete. Just their hours.
+        // ════════════════════════════════════════════════════════════════
+        const MyWorkHistoryView = ({ employee, onBack }) => {
+            const [fromDate, setFromDate] = useState(() => {
+                const d = new Date();
+                d.setDate(d.getDate() - 14);
+                return d.toISOString().slice(0, 10);
+            });
+            const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
+
+            const allShifts = (employee && employee.workHistory) || [];
+
+            const fromTs = fromDate ? new Date(fromDate + 'T00:00:00').getTime() : 0;
+            const toTs   = toDate   ? new Date(toDate   + 'T23:59:59').getTime() : Date.now();
+            const filteredShifts = allShifts.filter(s => {
+                const t = new Date(s.clockIn || s.date).getTime();
+                return t >= fromTs && t <= toTs;
+            });
+
+            const dateKey = (iso) => {
+                const d = new Date(iso);
+                const y = d.getFullYear();
+                const m = String(d.getMonth() + 1).padStart(2, '0');
+                const day = String(d.getDate()).padStart(2, '0');
+                return y + '-' + m + '-' + day;
+            };
+            const shiftsByDate = {};
+            filteredShifts.forEach(s => {
+                const key = dateKey(s.clockIn || s.date);
+                if (!shiftsByDate[key]) shiftsByDate[key] = [];
+                shiftsByDate[key].push(s);
+            });
+
+            const dayEntries = [];
+            if (employee && fromDate && toDate) {
+                const start = new Date(fromDate + 'T00:00:00');
+                const end = new Date(toDate + 'T00:00:00');
+                const today = new Date();
+                today.setHours(23, 59, 59, 999);
+                for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                    const key = dateKey(d);
+                    if (shiftsByDate[key]) {
+                        shiftsByDate[key].forEach(s => dayEntries.push({ type: 'shift', date: d.toISOString(), shift: s }));
+                    } else if (d <= today) {
+                        dayEntries.push({ type: 'absent', date: d.toISOString() });
+                    }
+                }
+                dayEntries.reverse();
+            }
+
+            const totalMinutes = filteredShifts.reduce((sum, s) => sum + (s.paidMinutes || s.grossMinutes || 0), 0);
+            const totalMinutesRounded = Math.round(totalMinutes);
+            const totalHours = Math.floor(totalMinutesRounded / 60) + 'h ' + (totalMinutesRounded % 60) + 'm';
+            const absentCount = dayEntries.filter(d => d.type === 'absent').length;
+
+            const fmtDuration = (mins) => {
+                if (!mins) return '0h';
+                const h = Math.floor(mins / 60);
+                const m = Math.round(mins % 60);
+                return h > 0 ? (h + 'h ' + m + 'm') : (m + 'm');
+            };
+            const fmtTime = (iso) => {
+                if (!iso) return '—';
+                return new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+            };
+            const fmtDate = (iso) => {
+                if (!iso) return '—';
+                return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: '2-digit' });
+            };
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+                    <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_120%,rgba(120,119,198,0.1),transparent)]"></div>
+
+                    <div className="relative border-b border-slate-700/50 bg-slate-800/30 backdrop-blur-xl">
+                        <div className="max-w-5xl mx-auto px-6 py-4 flex justify-between items-center">
+                            <div>
+                                <h1 className="text-3xl font-bold text-white" style={{ fontFamily: 'Georgia, serif' }}>WorkFlow</h1>
+                                <p className="text-slate-400 text-sm">My Work History · {employee.name}</p>
+                            </div>
+                            <button
+                                onClick={onBack}
+                                className="flex items-center gap-2 px-4 py-2 bg-slate-700/50 hover:bg-slate-700 text-white rounded-lg transition-all font-semibold"
+                            >
+                                ← Back to Dashboard
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="relative max-w-5xl mx-auto px-6 py-8">
+                        <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl p-6 border border-slate-700/50">
+
+                            <div className="grid md:grid-cols-2 gap-3 mb-5">
+                                <div>
+                                    <label className="text-slate-400 text-xs mb-1 block">From</label>
+                                    <input
+                                        type="date"
+                                        value={fromDate}
+                                        onChange={(e) => setFromDate(e.target.value)}
+                                        className="w-full px-3 py-2 bg-slate-900/50 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-slate-400 text-xs mb-1 block">To</label>
+                                    <input
+                                        type="date"
+                                        value={toDate}
+                                        onChange={(e) => setToDate(e.target.value)}
+                                        className="w-full px-3 py-2 bg-slate-900/50 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+                                    />
+                                </div>
+                            </div>
+
+                            {dayEntries.length === 0 ? (
+                                <div className="text-center py-12">
+                                    <p className="text-slate-400">No shifts in this date range</p>
+                                </div>
+                            ) : (
+                                <>
+                                    <div className="grid grid-cols-3 gap-3 mb-4">
+                                        <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                            <div className="text-slate-400 text-xs">Total Shifts</div>
+                                            <div className="text-white text-2xl font-bold">{filteredShifts.length}</div>
+                                        </div>
+                                        <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                            <div className="text-slate-400 text-xs">Total Hours</div>
+                                            <div className="text-emerald-400 text-2xl font-bold">{totalHours}</div>
+                                        </div>
+                                        <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50">
+                                            <div className="text-slate-400 text-xs">Days Absent</div>
+                                            <div className={'text-2xl font-bold ' + (absentCount > 0 ? 'text-red-400' : 'text-slate-500')}>{absentCount}</div>
+                                        </div>
+                                    </div>
+
+                                    <div className="overflow-x-auto">
+                                        <table className="w-full text-sm">
+                                            <thead>
+                                                <tr className="border-b border-slate-700/50 text-slate-400 text-left text-xs uppercase tracking-wide">
+                                                    <th className="py-2 px-2">Date</th>
+                                                    <th className="py-2 px-2">Clock In</th>
+                                                    <th className="py-2 px-2">Clock Out</th>
+                                                    <th className="py-2 px-2 text-right">Duration</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {dayEntries.map(entry => (
+                                                    entry.type === 'shift' ? (
+                                                        <tr key={'s_' + entry.shift.id} className="border-b border-slate-700/30 hover:bg-slate-700/20">
+                                                            <td className="py-2 px-2 text-slate-200">{fmtDate(entry.shift.clockIn || entry.shift.date)}</td>
+                                                            <td className="py-2 px-2 text-slate-300 font-mono text-xs">{fmtTime(entry.shift.clockIn)}</td>
+                                                            <td className="py-2 px-2 text-slate-300 font-mono text-xs">{fmtTime(entry.shift.clockOut)}</td>
+                                                            <td className="py-2 px-2 text-right text-emerald-400 font-semibold">{fmtDuration(entry.shift.paidMinutes || entry.shift.grossMinutes || 0)}</td>
+                                                        </tr>
+                                                    ) : (
+                                                        <tr key={'a_' + entry.date} className="border-b border-slate-700/30 bg-red-500/5">
+                                                            <td className="py-2 px-2 text-slate-400">{fmtDate(entry.date)}</td>
+                                                            <td colSpan="2" className="py-2 px-2 text-red-400 text-xs font-semibold uppercase tracking-wide">Absent</td>
+                                                            <td className="py-2 px-2 text-right text-slate-600">—</td>
+                                                        </tr>
+                                                    )
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
             const [currentView, setCurrentView] = useState('selectRole');
-            const [ownerDashboardView, setOwnerDashboardView] = useState('manage'); // 'manage', 'tasks'
+            const [ownerDashboardView, setOwnerDashboardView] = useState('manage'); // 'manage', 'tasks', 'history'
             const [employees, setEmployees] = useState([]);
             
             // Customer Service States
@@ -1098,7 +1780,7 @@
             const [editingEmployee, setEditingEmployee] = useState(null);
             const [editFormData, setEditFormData] = useState({});
             const [showPassword, setShowPassword] = useState({});
-            const [newEmployee, setNewEmployee] = useState({ username: '', password: '', name: '', phone: '', email: '', idDocument: null, isHourly: false, hourlyRate: '', clockInAlert: false });
+            const [newEmployee, setNewEmployee] = useState({ username: '', password: '', name: '', phone: '', email: '', idDocument: null });
             const [editingDailyTasks, setEditingDailyTasks] = useState(null);
             const [newDailyTask, setNewDailyTask] = useState('');
             const [newAssignedTask, setNewAssignedTask] = useState('');
@@ -1150,11 +1832,6 @@
                 localStorage.setItem('wf_theme', darkMode ? 'dark' : 'light');
             }, [darkMode]);
 
-            const [employeeView, setEmployeeView] = useState('dashboard');
-            const [clockTick, setClockTick] = useState(0);
-            const [attendanceView, setAttendanceView] = useState('live');
-            const [editingSession, setEditingSession] = useState(null); // {empId, entryId}
-            const [editSessionForm, setEditSessionForm] = useState({});
             // Date range defaults — use LOCAL date string, not toISOString (which is UTC).
             // Otherwise an owner in Brampton at 10 PM sees "today" as tomorrow's UTC date,
             // missing today's shifts.
@@ -1201,60 +1878,11 @@
                     if (session && session.type === 'employee') {
                         const employee = employees.find(emp => emp.id === session.data.id);
                         if (employee) {
-                            // RETROACTIVE CLOSE — only fires for previous-day sessions.
-                            // Uses TimeUtil/ShiftRecorder so the close time is correctly
-                            // anchored to the EMPLOYEE's timezone, not the browser's.
-                            // Does NOT auto-re-clock-in afterwards — employee clocks in manually.
-                            let restoredEmployee = employee;
-                            if (employee.clockedIn && employee.clockInTime) {
-                                const today      = TimeUtil.todayInEmployeeTZ(employee);
-                                const clockInDay = TimeUtil.dateInEmployeeTZ(employee, employee.clockInTime);
-                                if (today !== clockInDay) {
-                                    // Close at scheduled closing time on the original clock-in day
-                                    let clockOutISO;
-                                    if (employee.schedule?.closingTime) {
-                                        const closeUTC = TimeUtil.parseEmployeeTime(employee, clockInDay, employee.schedule.closingTime);
-                                        clockOutISO = closeUTC.toISOString();
-                                    } else {
-                                        clockOutISO = new Date(new Date(employee.clockInTime).getTime() + 8 * 3600000).toISOString();
-                                    }
-                                    restoredEmployee = ShiftRecorder.closeShift(employee, clockOutISO, {
-                                        autoClockOut: true, missedClockOut: true
-                                    });
-                                    if (useFirebase) FirebaseDB.saveEmployee(restoredEmployee);
-                                }
-                            }
-                            // No auto-re-clock-in — employee lands on dashboard and clocks in manually
-                            if (restoredEmployee !== employee) {
-                                setEmployees(prev => prev.map(e => e.id === employee.id ? restoredEmployee : e));
-                            }
-                            setCurrentEmployee(restoredEmployee);
+                            setCurrentEmployee(employee);
                             setCurrentView('employeeDashboard');
                         }
                     }
                     return;
-                }
-
-                // Keep currentEmployee in sync with live Firebase data.
-                // Firebase is the source of truth — owner force-clock-out propagates immediately.
-                // We only override Firebase clockedIn:false with local true if the local clock-in
-                // happened in the last 3 seconds (i.e. Firebase write hasn't landed yet).
-                if (currentEmployee && currentView === 'employeeDashboard') {
-                    const freshEmployee = employees.find(emp => emp.id === currentEmployee.id);
-                    if (freshEmployee) {
-                        const localClockInRecent = currentEmployee.clockedIn && currentEmployee.clockInTime &&
-                            (Date.now() - new Date(currentEmployee.clockInTime).getTime() < 3000);
-                        const merged = localClockInRecent ? {
-                            ...freshEmployee,
-                            clockedIn: currentEmployee.clockedIn,
-                            clockInTime: currentEmployee.clockInTime,
-                            isLateToday: currentEmployee.isLateToday,
-                            minutesLate: currentEmployee.minutesLate,
-                        } : freshEmployee;
-                        if (JSON.stringify(merged) !== JSON.stringify(currentEmployee)) {
-                            setCurrentEmployee(merged);
-                        }
-                    }
                 }
             }, [employees]);
             
@@ -1410,104 +2038,11 @@
             }, [currentView, owner?.username]);
 
             // 1-second tick drives live elapsed counter on employee card
-            useEffect(() => {
-                const interval = setInterval(() => setClockTick(t => t + 1), 1000);
-                return () => clearInterval(interval);
-            }, []);
 
-            // Warn employee + persist clock-out to localStorage when they close the tab.
-            // Async Firebase writes won't complete before the page dies, so we write to
-            // localStorage SYNCHRONOUSLY. Next login's checkAndCloseMissedSessions will
-            // pick it up and push to Firebase.
-            useEffect(() => {
-                const handleBeforeUnload = (e) => {
-                    if (currentView === 'employeeDashboard' && currentEmployee?.clockedIn) {
-                        const updated = ShiftRecorder.closeShift(currentEmployee, new Date().toISOString(), {
-                            autoClockOut: true, closedTab: true
-                        });
-                        try {
-                            const stored = localStorage.getItem('employees');
-                            if (stored) {
-                                const emps = JSON.parse(stored);
-                                const idx  = emps.findIndex(em => em.id === updated.id);
-                                if (idx !== -1) { emps[idx] = updated; localStorage.setItem('employees', JSON.stringify(emps)); }
-                            }
-                        } catch(_) {}
-                        e.preventDefault();
-                        e.returnValue = 'You are still clocked in. Please click "End Shift & Sign Out" before leaving.';
-                        return e.returnValue;
-                    }
-                };
-                window.addEventListener('beforeunload', handleBeforeUnload);
-                return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-            }, [currentView, currentEmployee]);
 
-            // Auto clock-out + late alert checker — runs whenever the app is open,
-            // not only when owner is on the dashboard. This means closing-time auto-out
-            // fires regardless of which page anyone is viewing.
-            useEffect(() => {
-                if (currentView === 'selectRole') return; // only run when someone is logged in
-                const GRACE_MINUTES = 5;
 
-                const check = () => {
-                    const now = new Date();
-                    let anyChange = false;
-                    const updated = employees.map(emp => {
-                        if (!emp.schedule) return emp;
-                        const today = TimeUtil.todayInEmployeeTZ(emp);
-
-                        // AUTO CLOCK-OUT at scheduled closing time (once per day, guarded by localStorage key)
-                        const autoOutKey = `autoClockOut_${emp.id}_${today}`;
-                        if (emp.clockedIn && emp.schedule?.closingTime && !localStorage.getItem(autoOutKey)) {
-                            const closeUTC = TimeUtil.parseEmployeeTime(emp, today, emp.schedule.closingTime);
-                            if (closeUTC && now >= closeUTC) {
-                                localStorage.setItem(autoOutKey, '1');
-                                // Use SCHEDULED close time, not `now` (which can be ≤60s late)
-                                anyChange = true;
-                                return ShiftRecorder.closeShift(emp, closeUTC.toISOString(), { autoClockOut: true });
-                            }
-                        }
-
-                        // LATE ALERT — fires once per day, 5 min after shift start
-                        if (emp.clockInAlert && !emp.clockedIn && emp.schedule?.openingTime) {
-                            const shiftUTC = TimeUtil.parseEmployeeTime(emp, today, emp.schedule.openingTime);
-                            if (shiftUTC) {
-                                const minsLate = (now - shiftUTC) / 60000;
-                                const alertKey = `lateAlert_${emp.id}_${today}`;
-                                if (minsLate >= GRACE_MINUTES && minsLate < 480 && !localStorage.getItem(alertKey)) {
-                                    localStorage.setItem(alertKey, '1');
-                                    if (typeof emailjs !== 'undefined' && owner?.email) {
-                                        try {
-                                            emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, {
-                                                to_email: owner.email,
-                                                to_name: 'Owner',
-                                                from_name: 'WorkFlow',
-                                                message: `LATE ALERT: ${emp.name} has not clocked in. Shift started ${Math.round(minsLate)} minute(s) ago.`,
-                                                verification_code: ''
-                                            });
-                                        } catch(_) {}
-                                    }
-                                }
-                            }
-                        }
-                        return emp;
-                    });
-
-                    if (anyChange) {
-                        setEmployees(updated);
-                        if (useFirebase) updated.filter((e,i) => e !== employees[i]).forEach(emp => FirebaseDB.saveEmployee(emp));
-                    }
-                };
-
-                check();
-                const interval = setInterval(check, 60000);
-                return () => clearInterval(interval);
-            }, [currentView, employees, owner]);
-
-            const handleOwnerLogin = async (e) => {
+            const handleOwnerLogin = (e) => {
                 e.preventDefault();
-                // Close missed sessions for all employees on owner login too
-                await checkAndCloseMissedSessions();
                 // Use the already-loaded owner state (from Firebase) instead of stale localStorage
                 if (loginForm.username === owner.username && loginForm.password === owner.password) {
                     SessionManager.saveSession('owner', { username: owner.username });
@@ -1726,45 +2261,9 @@
                 sessionStorage.removeItem('resetCodeTime');
             };
 
-            // Close any sessions where clockedIn:true but clock-in was on a previous day.
-            // Runs on any login — uses TimeUtil/ShiftRecorder for correct timezone handling
-            // and dedup-safe entry creation.
-            const checkAndCloseMissedSessions = async () => {
-                let anyChanged = false;
-                const updatedEmployees = employees.map(emp => {
-                    if (!emp.clockedIn || !emp.clockInTime) return emp;
-                    const today      = TimeUtil.todayInEmployeeTZ(emp);
-                    const clockInDay = TimeUtil.dateInEmployeeTZ(emp, emp.clockInTime);
-                    if (today === clockInDay) return emp; // Same day — still on shift
-                    // Previous day — close at scheduled closing time
-                    let clockOutISO;
-                    if (emp.schedule?.closingTime) {
-                        const closeUTC = TimeUtil.parseEmployeeTime(emp, clockInDay, emp.schedule.closingTime);
-                        clockOutISO = closeUTC.toISOString();
-                    } else {
-                        clockOutISO = new Date(new Date(emp.clockInTime).getTime() + 8 * 3600000).toISOString();
-                    }
-                    const closed = ShiftRecorder.closeShift(emp, clockOutISO, {
-                        autoClockOut: true, missedClockOut: true
-                    });
-                    if (closed !== emp) anyChanged = true;
-                    return closed;
-                });
-                if (anyChanged) {
-                    setEmployees(updatedEmployees);
-                    if (useFirebase) {
-                        const changed = updatedEmployees.filter((e, i) => e !== employees[i]);
-                        await Promise.all(changed.map(e => FirebaseDB.saveEmployee(e)));
-                    }
-                }
-                return updatedEmployees;
-            };
 
-            const handleEmployeeLogin = async (e) => {
+            const handleEmployeeLogin = (e) => {
                 e.preventDefault();
-
-                // Close any missed sessions for all employees on login
-                await checkAndCloseMissedSessions();
 
                 const employee = employees.find(
                     emp => emp.username === loginForm.username && emp.password === loginForm.password
@@ -1775,251 +2274,29 @@
                     return;
                 }
                 
-                // Check IP address for this specific employee
-                const ipCheck = await IPRestriction.checkEmployeeIP(employee);
-                if (!ipCheck.allowed) {
-                    setError(`Access denied. You can only login from your assigned office location(s). Your current IP: ${ipCheck.ip}`);
-                    return;
-                }
                 
                 SessionManager.saveSession('employee', { id: employee.id, username: employee.username });
 
-                // AUTO CLOCK-IN on login — uses ShiftRecorder.openShift which handles
-                // DST-safe lateness via TimeUtil.computeLateness (with 12h cap for off-hours)
-                let clockedInEmployee = employee;
-                if (!employee.clockedIn) {
-                    clockedInEmployee = ShiftRecorder.openShift(employee);
-                    const updatedEmployees = employees.map(e => e.id === employee.id ? clockedInEmployee : e);
-                    setEmployees(updatedEmployees);
-                    if (useFirebase) FirebaseDB.saveEmployee(clockedInEmployee);
-                }
 
-                setCurrentEmployee(clockedInEmployee);
+                setCurrentEmployee(employee);
                 setCurrentView('employeeDashboard');
                 setError('');
                 setLoginForm({ username: '', password: '' });
             };
 
             const handleEmployeeSignOut = () => {
-                // Auto clock-out on sign-out via ShiftRecorder (dedup-safe — won't double-write
-                // if handleClockOut already ran from the End Shift button).
-                if (currentEmployee?.clockedIn) {
-                    const updated = ShiftRecorder.closeShift(currentEmployee, new Date().toISOString());
-                    const updatedEmployees = employees.map(e => e.id === updated.id ? updated : e);
-                    setEmployees(updatedEmployees);
-                    if (useFirebase) FirebaseDB.saveEmployee(updated);
-                }
                 SessionManager.clearSession();
                 setCurrentEmployee(null);
                 setCurrentView('selectRole');
                 setError('');
             };
             
-            // Force clock-out (owner action) — uses ShiftRecorder
-            const handleForceClockOut = (empId) => {
-                const emp = employees.find(e => e.id === empId);
-                if (!emp || !emp.clockedIn) return;
-                const updated = ShiftRecorder.closeShift(emp, new Date().toISOString(), { forcedByOwner: true });
-                const updatedEmployees = employees.map(e => e.id === empId ? updated : e);
-                setEmployees(updatedEmployees);
-                if (useFirebase) FirebaseDB.saveEmployee(updated);
-            };
 
-            // Manual clock-in / clock-out via ShiftRecorder
-            const handleClockIn = () => {
-                if (currentEmployee.clockedIn) return;
-                const updated = ShiftRecorder.openShift(currentEmployee);
-                setCurrentEmployee(updated);
-                const updatedEmployees = employees.map(e => e.id === updated.id ? updated : e);
-                setEmployees(updatedEmployees);
-                if (useFirebase) FirebaseDB.saveEmployee(updated);
-            };
 
-            const handleClockOut = () => {
-                if (!currentEmployee.clockedIn) return;
-                const updated = ShiftRecorder.closeShift(currentEmployee, new Date().toISOString());
-                setCurrentEmployee(updated);
-                const updatedEmployees = employees.map(e => e.id === updated.id ? updated : e);
-                setEmployees(updatedEmployees);
-                if (useFirebase) FirebaseDB.saveEmployee(updated);
-            };
 
-            // ── SESSION EDIT HELPERS ──
-            // Uses the EMPLOYEE's timezone for parsing form fields, not the browser's local time.
-            // Caller passes the empId so we know which timezone to use.
-            const recalcEntry = (form, emp) => {
-                const tz = TimeUtil.tzFor(emp);
-                const clockIn  = TimeUtil.parseInTZ(form.clockInDate,  form.clockInTime,  tz);
-                const clockOut = TimeUtil.parseInTZ(form.clockOutDate, form.clockOutTime, tz);
-                if (!clockIn || !clockOut || isNaN(clockIn) || isNaN(clockOut)) {
-                    return { grossMin: 0, paidMin: 0, paidHours: 0, pay: 0 };
-                }
-                const grossMin = Math.max(0, (clockOut - clockIn) / 60000);
-                const breakMin = parseInt(form.breakMinutes) || 0;
-                const paidMin = Math.max(0, grossMin - breakMin);
-                const paidHours = parseFloat((paidMin / 60).toFixed(2));
-                const rate = parseFloat(form.hourlyRate) || 0;
-                const pay = parseFloat((paidHours * rate).toFixed(2));
-                return { grossMin: Math.round(grossMin), paidMin: Math.round(paidMin), paidHours, pay };
-            };
 
-            // Populate the edit form using the EMPLOYEE's timezone, not the browser's local time.
-            // Owner in any timezone sees the actual shift times.
-            const handleEditSession = (empId, entry) => {
-                const emp = employees.find(e => e.id === empId);
-                const inFields  = TimeUtil.isoToFormFields(emp, entry.clockIn);
-                const outFields = TimeUtil.isoToFormFields(emp, entry.clockOut);
-                setEditingSession({ empId, entryId: entry.id });
-                setEditSessionForm({
-                    clockInDate:  inFields.date,  clockInTime:  inFields.time,
-                    clockOutDate: outFields.date, clockOutTime: outFields.time,
-                    breakMinutes: entry.breakMinutes || 0,
-                    hourlyRate:   entry.hourlyRate   || 0
-                });
-            };
 
-            const handleSaveSession = (empId, entryId) => {
-                const emp = employees.find(e => e.id === empId);
-                const f   = editSessionForm;
-                const tz  = TimeUtil.tzFor(emp);
-                const calc = recalcEntry(f, emp);
-                // Parse form values in the EMPLOYEE's timezone
-                const clockInISO  = TimeUtil.parseInTZ(f.clockInDate,  f.clockInTime,  tz)?.toISOString();
-                const clockOutISO = TimeUtil.parseInTZ(f.clockOutDate, f.clockOutTime, tz)?.toISOString();
-                const updatedEmployees = employees.map(em => {
-                    if (em.id !== empId) return em;
-                    return {
-                        ...em,
-                        workHistory: (em.workHistory || []).map(e => e.id !== entryId ? e : {
-                            ...e,
-                            date: clockOutISO, // session date = clock-out date
-                            clockIn: clockInISO,
-                            clockOut: clockOutISO,
-                            breakMinutes: parseInt(f.breakMinutes) || 0,
-                            hourlyRate: parseFloat(f.hourlyRate) || 0,
-                            grossMinutes: calc.grossMin,
-                            paidMinutes: calc.paidMin,
-                            paidHours: calc.paidHours,
-                            pay: calc.pay,
-                            edited: true
-                        })
-                    };
-                });
-                setEmployees(updatedEmployees);
-                if (currentEmployee?.id === empId) {
-                    const updatedEmp = updatedEmployees.find(e => e.id === empId);
-                    if (updatedEmp) setCurrentEmployee(updatedEmp);
-                }
-                if (useFirebase) {
-                    const em = updatedEmployees.find(e => e.id === empId);
-                    if (em) FirebaseDB.saveEmployee(em);
-                }
-                setEditingSession(null);
-                setEditSessionForm({});
-            };
 
-            const handleDeleteSession = (empId, entryId) => {
-                if (!window.confirm('Delete this session? This cannot be undone.')) return;
-                const updatedEmployees = employees.map(emp => {
-                    if (emp.id !== empId) return emp;
-                    return { ...emp, workHistory: (emp.workHistory || []).filter(e => e.id !== entryId) };
-                });
-                setEmployees(updatedEmployees);
-                if (currentEmployee?.id === empId) {
-                    const updatedEmp = updatedEmployees.find(e => e.id === empId);
-                    if (updatedEmp) setCurrentEmployee(updatedEmp);
-                }
-                if (useFirebase) {
-                    const emp = updatedEmployees.find(e => e.id === empId);
-                    if (emp) FirebaseDB.saveEmployee(emp);
-                }
-            };
-
-            // Add a manual session — anchored to the EMPLOYEE's timezone.
-            // Pre-computes paid time so saving without edits gives correct values.
-            const handleAddSession = (empId) => {
-                const emp = employees.find(e => e.id === empId);
-                if (!emp) return;
-                const today = TimeUtil.todayInEmployeeTZ(emp);
-                const open  = emp.schedule?.openingTime || '09:00';
-                const close = emp.schedule?.closingTime || '17:00';
-                const clockInISO  = TimeUtil.parseEmployeeTime(emp, today, open).toISOString();
-                const clockOutISO = TimeUtil.parseEmployeeTime(emp, today, close).toISOString();
-                const newEntry = ShiftRecorder.buildEntry(emp, clockInISO, clockOutISO,
-                    emp.assignedBreakMinutes || 0, { manualEntry: true });
-                const updatedEmployees = employees.map(e =>
-                    e.id === empId ? { ...e, workHistory: [...(e.workHistory || []), newEntry] } : e
-                );
-                setEmployees(updatedEmployees);
-                if (useFirebase) {
-                    const updEmp = updatedEmployees.find(e => e.id === empId);
-                    if (updEmp) FirebaseDB.saveEmployee(updEmp);
-                }
-                handleEditSession(empId, newEntry);
-            };
-
-            const handleBulkDeleteShifts = (empId, filteredEntries) => {
-                const count = filteredEntries.length;
-                if (count === 0) { alert('No shifts to delete in this date range.'); return; }
-                if (!window.confirm(`Delete ${count} shift${count !== 1 ? 's' : ''} in the selected date range for this employee? This cannot be undone.\nDo this after you have paid them.`)) return;
-                const filteredIds = new Set(filteredEntries.map(e => e.id));
-                const updatedEmployees = employees.map(e =>
-                    e.id === empId
-                        ? { ...e, workHistory: (e.workHistory || []).filter(s => !filteredIds.has(s.id)) }
-                        : e
-                );
-                setEmployees(updatedEmployees);
-                if (currentEmployee?.id === empId) {
-                    const updatedEmp = updatedEmployees.find(e => e.id === empId);
-                    if (updatedEmp) setCurrentEmployee(updatedEmp);
-                }
-                if (useFirebase) {
-                    const emp = updatedEmployees.find(e => e.id === empId);
-                    if (emp) FirebaseDB.saveEmployee(emp);
-                }
-            };
-
-            const handleExportPDF = (emp, entries) => {
-                const fmtT = (iso) => iso ? new Date(iso).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:true}) : '--';
-                const fmtD = (iso) => iso ? new Date(iso).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'}) : '--';
-                const fmtDur = (m) => { const h=Math.floor(m/60),r=Math.round(m%60); return h>0?`${h}h ${r}m`:`${r}m`; };
-                const totalPaid = entries.reduce((s,e)=>s+(e.paidMinutes||0),0);
-                const rows = entries.map(e => `
-                    <tr>
-                        <td>${fmtD(e.date)}</td>
-                        <td>${fmtT(e.clockIn)}</td>
-                        <td>${fmtT(e.clockOut)}${e.autoClockOut?' (auto)':''}</td>
-                        <td>${e.breakMinutes||0} min</td>
-                        <td><strong>${fmtDur(e.paidMinutes||0)}</strong></td><td>$${(e.pay||0).toFixed(2)}</td>
-                    </tr>`).join('');
-                const html = `<!DOCTYPE html><html><head><title>${emp.name} — Work Hours Report</title>
-                <style>
-                    body{font-family:Arial,sans-serif;padding:32px;color:#111;max-width:800px;margin:0 auto;}
-                    h1{font-size:22px;margin:0;}h2{font-size:14px;color:#555;margin:4px 0 24px;}
-                    table{width:100%;border-collapse:collapse;font-size:13px;}
-                    th{background:#f3f4f6;text-align:left;padding:8px 10px;border-bottom:2px solid #e5e7eb;font-size:11px;text-transform:uppercase;letter-spacing:.05em;}
-                    td{padding:8px 10px;border-bottom:1px solid #f1f1f1;}
-                    tr:last-child td{border-bottom:none;}
-                    .totals{margin-top:20px;font-size:13px;color:#555;}
-                    .totals strong{font-size:16px;color:#111;}
-                    @media print{body{padding:16px;}}
-                </style></head><body>
-                <h1>${emp.name}</h1>
-                <h2>Work Hours Report · Generated ${new Date().toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'})}</h2>
-                <table><thead><tr><th>Date</th><th>Clock In</th><th>Clock Out</th><th>Break</th><th>Hours Worked</th><th>Pay ($)</th></tr></thead>
-                <tbody>${rows}</tbody></table>
-                <div class="totals" style="margin-top:20px;">
-                    Total shifts: <strong>${entries.length}</strong> &nbsp;·&nbsp;
-                    Total hours worked: <strong>${fmtDur(totalPaid)}</strong> &nbsp;·&nbsp;
-                    Total pay: <strong>$${entries.reduce((s,e)=>s+(e.pay||0),0).toFixed(2)}</strong>
-                </div>
-                </body></html>`;
-                const win = window.open('','_blank');
-                win.document.write(html);
-                win.document.close();
-                win.focus();
-                setTimeout(()=>win.print(), 400);
-            };
 
             const toggleDailyTask = (taskId) => {
                 const task = currentEmployee.dailyTasks.find(t => t.id === taskId);
@@ -2225,18 +2502,8 @@
                         assignedTasks: [],
                         notes: '',
                         tasksAssignedToOwner: [],
-                        assignedBreakMinutes: 30,
-                        isHourly: newEmployee.isHourly || false,
-                        clockInAlert: newEmployee.clockInAlert || false,
-                        breakStartTime: '',
-                        breakEndTime: '',
-                        hourlyRate: newEmployee.isHourly ? (parseFloat(newEmployee.hourlyRate) || 0) : 0,
-                        clockedIn: false,
-                        clockInTime: null,
-                        clockOutTime: null,
-                        workHistory: [],
-                        isLateToday: false,
-                        minutesLate: 0,
+                        alertsEnabled: false,
+                        alertRecipients: 'owner',
                         };
                     setEmployees([...employees, employee]);
                     setNewEmployee({ username: '', password: '', name: '', phone: '', email: '', idDocument: null });
@@ -3364,6 +3631,29 @@
                                         </button>
                                         <button
                                             onClick={() => {
+                                                const newPhone = prompt('Enter the WhatsApp number to receive late clock-in/out alerts (include country code, e.g. +14165551234):', owner.alertPhone || '');
+                                                if (newPhone === null) return;
+                                                const phone = newPhone.trim();
+                                                if (phone && !/^\+\d{10,15}$/.test(phone)) {
+                                                    alert('Phone must start with + and country code (e.g. +14165551234).');
+                                                    return;
+                                                }
+                                                const updatedOwner = { ...owner, alertPhone: phone, alertChannel: 'whatsapp' };
+                                                setOwner(updatedOwner);
+                                                Storage.saveOwner(updatedOwner);
+                                                if (useFirebase) {
+                                                    FirebaseDB.saveOwner(updatedOwner);
+                                                }
+                                                alert(`WhatsApp alerts will be sent to ${phone || '(no phone set)'}.`);
+                                            }}
+                                            className="flex items-center gap-2 px-4 py-2 bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 rounded-lg transition-all"
+                                            title="Configure late clock-in/out alerts"
+                                        >
+                                            <AlertCircle size={18} />
+                                            {owner.alertPhone ? `Alerts: ${owner.alertPhone}` : 'Set Alerts'}
+                                        </button>
+                                        <button
+                                            onClick={() => {
                                                 SessionManager.clearSession();
                                                 setCurrentView('selectRole');
                                             }}
@@ -3377,16 +3667,6 @@
                                 
                                 {/* Navigation Tabs */}
                                 <div className="flex gap-4">
-                                    <button
-                                        onClick={() => setOwnerDashboardView('attendance')}
-                                        className={`px-6 py-3 rounded-lg font-semibold transition-all ${
-                                            ownerDashboardView === 'attendance'
-                                                ? 'bg-gradient-to-r from-green-500 to-teal-600 text-white shadow-lg'
-                                                : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'
-                                        }`}
-                                    >
-                                        Attendance
-                                    </button>
                                     <button
                                         onClick={() => setOwnerDashboardView('manage')}
                                         className={`px-6 py-3 rounded-lg font-semibold transition-all ${
@@ -3407,6 +3687,30 @@
                                     >
                                         Tasks
                                     </button>
+                                    <button
+                                        onClick={() => setOwnerDashboardView('live')}
+                                        className={`px-6 py-3 rounded-lg font-semibold transition-all flex items-center gap-2 ${
+                                            ownerDashboardView === 'live'
+                                                ? 'bg-gradient-to-r from-green-500 to-emerald-600 text-white shadow-lg'
+                                                : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'
+                                        }`}
+                                    >
+                                        <span className="relative inline-flex">
+                                            <span className={`w-2 h-2 rounded-full ${ownerDashboardView === 'live' ? 'bg-white' : 'bg-green-500'}`}></span>
+                                            <span className={`absolute inset-0 w-2 h-2 rounded-full animate-ping opacity-75 ${ownerDashboardView === 'live' ? 'bg-white' : 'bg-green-500'}`}></span>
+                                        </span>
+                                        Live Status
+                                    </button>
+                                    <button
+                                        onClick={() => setOwnerDashboardView('history')}
+                                        className={`px-6 py-3 rounded-lg font-semibold transition-all ${
+                                            ownerDashboardView === 'history'
+                                                ? 'bg-gradient-to-r from-emerald-500 to-teal-600 text-white shadow-lg'
+                                                : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'
+                                        }`}
+                                    >
+                                        Work History
+                                    </button>
                                     <a
                                         href="https://amandeepsin.github.io/customer-call-logs-portal/"
                                         target="_blank"
@@ -3423,364 +3727,7 @@
                         </div>
 
                         <div className="relative max-w-7xl mx-auto px-6 py-8">
-                            
 
-                            {/* ═══════════════════════════════════════
-                                ATTENDANCE VIEW
-                            ═══════════════════════════════════════ */}
-                            {ownerDashboardView === 'attendance' && (() => {
-                                const now = new Date();
-
-                                const fmtTime = (iso) => {
-                                    if (!iso) return '--:--';
-                                    return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-                                };
-                                const fmtDate = (iso) => {
-                                    if (!iso) return '';
-                                    return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
-                                };
-                                const fmtDuration = (minutes) => {
-                                    if (!minutes && minutes !== 0) return '--';
-                                    const h = Math.floor(minutes / 60);
-                                    const m = Math.round(minutes % 60);
-                                    return h > 0 ? `${h}h ${m}m` : `${m}m`;
-                                };
-                                const elapsed = (clockInISO) => {
-                                    const mins = (now - new Date(clockInISO)) / 60000;
-                                    return fmtDuration(mins);
-                                };
-
-                                // Live stats
-
-
-                                return (
-                                    <div className="space-y-6">
-
-                                        {/* Sub tabs */}
-                                        <div className="flex gap-3">
-                                            <button
-                                                onClick={() => setAttendanceView('live')}
-                                                className={`px-5 py-2 rounded-lg font-semibold text-sm transition-all ${attendanceView === 'live' ? 'bg-green-600 text-white' : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'}`}
-                                            >
-                                                Live Today
-                                            </button>
-                                            <button
-                                                onClick={() => setAttendanceView('history')}
-                                                className={`px-5 py-2 rounded-lg font-semibold text-sm transition-all ${attendanceView === 'history' ? 'bg-blue-600 text-white' : 'bg-slate-700/50 text-slate-300 hover:bg-slate-700'}`}
-                                            >
-                                                Work History
-                                            </button>
-                                        </div>
-
-                                        {attendanceView === 'live' && (
-                                             <div className="space-y-2">
-
-                                                {/* Employee list */}
-                                                <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-slate-700/50 overflow-hidden">
-                                                    <div className="p-4 border-b border-slate-700/50">
-                                                        <h3 className="text-white font-bold text-lg">All employees — today</h3>
-                                                        <p className="text-slate-400 text-xs mt-1">Stale sessions (clocked in &gt; 24 h with no activity) are flagged.</p>
-                                                    </div>
-                                                    <div className="divide-y divide-slate-700/30">
-                                                        {employees.map(emp => {
-                                                            void clockTick; // drives 1s re-render for live elapsed
-                                                            const now = new Date();
-                                                            // Display formatters use the EMPLOYEE's timezone, not the browser's
-                                                            const elapsedMins = emp.clockInTime
-                                                                ? Math.floor((now - new Date(emp.clockInTime)) / 60000)
-                                                                : 0;
-                                                            const isStaleSession = emp.clockedIn && elapsedMins > 24 * 60;
-                                                            return (
-                                                                <div key={emp.id} className="flex items-center gap-4 px-5 py-4 wf-live-row">
-                                                                    <div className="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center text-white text-sm font-bold flex-shrink-0">
-                                                                        {emp.name.charAt(0).toUpperCase()}
-                                                                    </div>
-                                                                    <div className="flex-1 min-w-0">
-                                                                        <div className="text-white font-semibold text-sm">{emp.name}</div>
-                                                                        {emp.clockedIn ? (
-                                                                            <div className="flex items-center gap-3 mt-0.5 flex-wrap">
-                                                                                <span className="text-green-400 text-xs font-medium">
-                                                                                    {TimeUtil.formatEmployeeDate(emp, emp.clockInTime)} · {TimeUtil.formatEmployeeTime(emp, emp.clockInTime)}
-                                                                                </span>
-                                                                                <span className="text-slate-500 text-xs">·</span>
-                                                                                <span className={`text-xs font-medium font-mono ${isStaleSession ? 'text-red-400' : 'text-amber-400'}`}>
-                                                                                    {TimeUtil.formatDuration(elapsedMins)} elapsed
-                                                                                </span>
-                                                                                {isStaleSession && (
-                                                                                    <span className="text-xs px-2 py-0.5 rounded-full bg-red-500/20 text-red-400 font-semibold">
-                                                                                        ⚠ Stale — likely missed clock-out
-                                                                                    </span>
-                                                                                )}
-                                                                            </div>
-                                                                        ) : (
-                                                                            <div className="text-slate-500 text-xs mt-0.5">Not clocked in</div>
-                                                                        )}
-                                                                    </div>
-                                                                    <div className="flex items-center gap-2 flex-shrink-0">
-                                                                        {emp.clockedIn ? (
-                                                                            <>
-                                                                                <span className="px-3 py-1 bg-green-500/20 text-green-400 rounded-full text-xs font-semibold">Working</span>
-                                                                                <button
-                                                                                    onClick={() => handleForceClockOut(emp.id)}
-                                                                                    className="px-3 py-1 bg-red-500/20 hover:bg-red-500/40 text-red-400 rounded-full text-xs font-semibold transition-all"
-                                                                                    title="Force clock out"
-                                                                                >
-                                                                                    Clock Out
-                                                                                </button>
-                                                                            </>
-                                                                        ) : (
-                                                                            <span className="px-3 py-1 bg-slate-700/50 text-slate-400 rounded-full text-xs">Not clocked in</span>
-                                                                        )}
-                                                                    </div>
-                                                                </div>
-                                                            );
-                                                        })}
-                                                    </div>
-                                                </div>
-                                             </div>
-                                        )}
-
-
-                                        {attendanceView === 'history' && (() => {
-                                            // Range filter
-                                            const rangeFrom = historyDateFrom ? new Date(historyDateFrom + 'T00:00:00') : new Date(0);
-                                            const rangeTo   = historyDateTo   ? new Date(historyDateTo   + 'T23:59:59') : new Date();
-
-                                            const hourlyEmployees = employees.filter(e => e.isHourly);
-                                            const filteredTotals = hourlyEmployees.map(emp => {
-                                                // Deduplicate by clockIn timestamp to prevent duplicate auto-out entries
-                                const seen = new Set();
-                                const entries = (emp.workHistory || [])
-                                                    .filter(e => {
-                                                        const key = e.clockIn + '_' + e.clockOut;
-                                                        if (seen.has(key)) return false;
-                                                        seen.add(key);
-                                                        const d = new Date(e.date);
-                                                        return d >= rangeFrom && d <= rangeTo;
-                                                    })
-                                                    .sort((a,b) => new Date(b.date) - new Date(a.date));
-                                                const mins = entries.reduce((s,e) => s + (e.paidMinutes || 0), 0);
-                                                return { emp, entries, mins };
-                                            });
-
-                                            const grandMins = filteredTotals.reduce((s,r)=>s+r.mins,0);
-
-                                            const livePreview = editingSession ? (() => {
-                                                try {
-                                                    const editEmp = employees.find(e => e.id === editingSession.empId);
-                                                    return recalcEntry(editSessionForm, editEmp);
-                                                } catch(e) { return null; }
-                                            })() : null;
-
-                                            return (
-                                                <div className="space-y-5">
-
-                                                    {/* Header bar */}
-                                                    <div className="flex flex-wrap items-center justify-between gap-3">
-                                                        <div>
-                                                            <h3 className="text-white font-bold text-xl">Work History</h3>
-                                                            <p className="text-slate-400 text-sm mt-0.5">Hourly employees only · editable</p>
-                                                        </div>
-                                                        {/* Date range picker */}
-                                                        <div className="flex items-center gap-2">
-                                                            <div className="flex items-center gap-2 bg-slate-800/60 border border-slate-700/50 rounded-lg px-3 py-1.5">
-                                                                <span className="text-slate-400 text-xs">From</span>
-                                                                <input
-                                                                    type="date"
-                                                                    value={historyDateFrom}
-                                                                    onChange={e => setHistoryDateFrom(e.target.value)}
-                                                                    className="bg-transparent text-white text-sm focus:outline-none"
-                                                                />
-                                                            </div>
-                                                            <span className="text-slate-500 text-sm">→</span>
-                                                            <div className="flex items-center gap-2 bg-slate-800/60 border border-slate-700/50 rounded-lg px-3 py-1.5">
-                                                                <span className="text-slate-400 text-xs">To</span>
-                                                                <input
-                                                                    type="date"
-                                                                    value={historyDateTo}
-                                                                    onChange={e => setHistoryDateTo(e.target.value)}
-                                                                    className="bg-transparent text-white text-sm focus:outline-none"
-                                                                />
-                                                            </div>
-                                                        </div>
-                                                    </div>
-
-                                                    {/* Grand totals strip */}
-                                                    <div className="grid grid-cols-2 gap-3 wf-add-emp-form">
-                                                        <div className="bg-slate-800/60 rounded-xl border border-slate-700/40 p-4">
-                                                            <div className="text-xs text-slate-400 uppercase tracking-wider mb-1">Total Hours</div>
-                                                            <div className="text-2xl font-bold text-white">{fmtDuration(grandMins)}</div>
-                                                        </div>
-                                                        <div className="bg-slate-800/60 rounded-xl border border-slate-700/40 p-4">
-                                                            <div className="text-xs text-slate-400 uppercase tracking-wider mb-1">Shifts</div>
-                                                            <div className="text-2xl font-bold text-white">{filteredTotals.reduce((s,r)=>s+r.entries.length,0)}</div>
-                                                        </div>
-                                                    </div>
-
-                                                    {/* Per-employee panels */}
-                                                    {filteredTotals.map(({ emp, entries, mins }) => (
-                                                        <div key={emp.id} className="bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-slate-700/50 overflow-hidden">
-
-                                                            {/* Employee header */}
-                                                            <div className="flex items-center gap-4 px-5 py-4 border-b border-slate-700/50 bg-slate-800/80 wf-emp-hist-header">
-                                                                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white font-bold text-sm flex-shrink-0">
-                                                                    {emp.name.charAt(0).toUpperCase()}
-                                                                </div>
-                                                                <div className="flex-1 min-w-0">
-                                                                    <div className="text-white font-bold text-base">{emp.name}</div>
-                                                                    <div className="text-slate-400 text-xs">{emp.schedule?.openingTime||'?'} – {emp.schedule?.closingTime||'?'}</div>
-                                                                </div>
-                                                                <div className="text-right mr-4">
-                                                                    <div className="text-white font-semibold">{fmtDuration(mins)}</div>
-                                                                </div>
-                                                                <div className="flex gap-2">
-                                                                    <button
-                                                                        onClick={() => handleAddSession(emp.id)}
-                                                                        className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 rounded-lg text-xs font-medium transition-all"
-                                                                        title="Add session manually"
-                                                                    >
-                                                                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2.5"><path d="M12 5v14M5 12h14"/></svg>
-                                                                        Add
-                                                                    </button>
-                                                                    <button
-                                                                        onClick={() => handleExportPDF(emp, entries)}
-                                                                        className="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600/20 hover:bg-violet-600/40 text-violet-400 rounded-lg text-xs font-medium transition-all"
-                                                                        title="Export PDF"
-                                                                    >
-                                                                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2"><path d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
-                                                                        PDF
-                                                                    </button>
-                                                                    <button
-                                                                        onClick={() => handleBulkDeleteShifts(emp.id, entries)}
-                                                                        className="flex items-center gap-1.5 px-3 py-1.5 bg-red-600/20 hover:bg-red-600/40 text-red-400 rounded-lg text-xs font-medium transition-all"
-                                                                        title="Clear all shifts after paying employee"
-                                                                    >
-                                                                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6m5 0V4a1 1 0 011-1h2a1 1 0 011 1v2"/></svg>
-                                                                        Clear All Shifts
-                                                                    </button>
-                                                                </div>
-                                                            </div>
-
-                                                            {/* Shifts */}
-                                                            {entries.length === 0 ? (
-                                                                <div className="px-5 py-8 text-center text-slate-500 text-sm">No shifts in this range</div>
-                                                            ) : (
-                                                                <div className="divide-y divide-slate-700/30">
-                                                                    {entries.map((entry) => {
-                                                                        const isEditing = editingSession?.empId === emp.id && editingSession?.entryId === entry.id;
-                                                                        return (
-                                                                            <div key={entry.id}>
-                                                                                {isEditing ? (
-                                                                                    /* ── EDIT ROW ── */
-                                                                                    <div className="px-5 py-4 bg-blue-900/20 border-l-4 border-blue-500">
-                                                                                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
-                                                                                            <div>
-                                                                                                <label className="text-slate-400 text-xs block mb-1">Clock In Date</label>
-                                                                                                <input type="date" value={editSessionForm.clockInDate}
-                                                                                                    onChange={e => setEditSessionForm({...editSessionForm, clockInDate: e.target.value})}
-                                                                                                    className="w-full px-2 py-1.5 bg-slate-900/60 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-blue-500"/>
-                                                                                            </div>
-                                                                                            <div>
-                                                                                                <label className="text-slate-400 text-xs block mb-1">Clock In Time</label>
-                                                                                                <input type="time" value={editSessionForm.clockInTime}
-                                                                                                    onChange={e => setEditSessionForm({...editSessionForm, clockInTime: e.target.value})}
-                                                                                                    className="w-full px-2 py-1.5 bg-slate-900/60 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-blue-500"/>
-                                                                                            </div>
-                                                                                            <div>
-                                                                                                <label className="text-slate-400 text-xs block mb-1">Clock Out Date</label>
-                                                                                                <input type="date" value={editSessionForm.clockOutDate}
-                                                                                                    onChange={e => setEditSessionForm({...editSessionForm, clockOutDate: e.target.value})}
-                                                                                                    className="w-full px-2 py-1.5 bg-slate-900/60 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-blue-500"/>
-                                                                                            </div>
-                                                                                            <div>
-                                                                                                <label className="text-slate-400 text-xs block mb-1">Clock Out Time</label>
-                                                                                                <input type="time" value={editSessionForm.clockOutTime}
-                                                                                                    onChange={e => setEditSessionForm({...editSessionForm, clockOutTime: e.target.value})}
-                                                                                                    className="w-full px-2 py-1.5 bg-slate-900/60 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-blue-500"/>
-                                                                                            </div>
-                                                                                            <div>
-                                                                                                <label className="text-slate-400 text-xs block mb-1">Break (min)</label>
-                                                                                                <input type="number" min="0" value={editSessionForm.breakMinutes}
-                                                                                                    onChange={e => setEditSessionForm({...editSessionForm, breakMinutes: e.target.value})}
-                                                                                                    className="w-full px-2 py-1.5 bg-slate-900/60 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-blue-500"/>
-                                                                                            </div>
-                                                                                            <div>
-                                                                                                <label className="text-slate-400 text-xs block mb-1">Rate ($/hr)</label>
-                                                                                                <input type="number" step="0.01" min="0" value={editSessionForm.hourlyRate}
-                                                                                                    onChange={e => setEditSessionForm({...editSessionForm, hourlyRate: e.target.value})}
-                                                                                                    className="w-full px-2 py-1.5 bg-slate-900/60 border border-slate-600 rounded text-white text-sm focus:outline-none focus:border-blue-500"/>
-                                                                                            </div>
-                                                                                            {livePreview && (
-                                                                                                <div className="col-span-2 flex items-end gap-4 bg-slate-900/40 rounded-lg px-3 py-2">
-                                                                                                    <div><span className="text-slate-400 text-xs">Paid: </span><span className="text-white font-semibold">{fmtDuration(livePreview.paidMin)}</span></div>
-                                                                                                    <div><span className="text-slate-400 text-xs">Pay: </span><span className="text-green-400 font-bold">${livePreview.pay.toFixed(2)}</span></div>
-                                                                                                </div>
-                                                                                            )}
-                                                                                        </div>
-                                                                                        <div className="flex gap-2">
-                                                                                            <button onClick={() => handleSaveSession(emp.id, entry.id)}
-                                                                                                className="px-4 py-1.5 bg-green-600 hover:bg-green-500 text-white rounded-lg text-sm font-medium">
-                                                                                                Save
-                                                                                            </button>
-                                                                                            <button onClick={() => { setEditingSession(null); setEditSessionForm({}); }}
-                                                                                                className="px-4 py-1.5 bg-slate-600 hover:bg-slate-500 text-white rounded-lg text-sm">
-                                                                                                Cancel
-                                                                                            </button>
-                                                                                        </div>
-                                                                                    </div>
-                                                                                ) : (
-                                                                                    /* ── READ ROW ── */
-                                                                                    <div className="flex items-center gap-3 px-5 py-3 hover:bg-slate-700/20 group transition-all">
-                                                                                        <div className="flex-1 min-w-0">
-                                                                                            <div className="flex items-center gap-2 flex-wrap">
-                                                                                                <span className="text-white text-sm font-medium">{fmtDate(entry.date)}</span>
-                                                                                                {entry.autoClockOut && <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded-full">auto out</span>}
-                                                                                                {entry.edited && <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full">edited</span>}
-                                                                                                {entry.manualEntry && <span className="text-xs bg-purple-500/20 text-purple-400 px-2 py-0.5 rounded-full">manual</span>}
-                                                                                            </div>
-                                                                                            <div className="text-slate-400 text-xs mt-0.5">
-                                                                                                {fmtTime(entry.clockIn)} → {fmtTime(entry.clockOut)} · {entry.breakMinutes||0}m break
-                                                                                            </div>
-                                                                                        </div>
-                                                                                        <div className="text-right mr-2">
-                                                                                            <div className="text-white text-sm font-medium">{fmtDuration(entry.paidMinutes||0)}</div>
-                                                                                        </div>
-                                                                                        <div className="flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                                                                                            <button onClick={() => handleEditSession(emp.id, entry)}
-                                                                                                className="p-1.5 bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 rounded-lg transition-all"
-                                                                                                title="Edit session">
-                                                                                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2"><path d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
-                                                                                            </button>
-                                                                                            <button onClick={() => handleDeleteSession(emp.id, entry.id)}
-                                                                                                className="p-1.5 bg-red-600/20 hover:bg-red-600/40 text-red-400 rounded-lg transition-all"
-                                                                                                title="Delete session">
-                                                                                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6m5 0V4a1 1 0 011-1h2a1 1 0 011 1v2"/></svg>
-                                                                                            </button>
-                                                                                        </div>
-                                                                                    </div>
-                                                                                )}
-                                                                            </div>
-                                                                        );
-                                                                    })}
-                                                                    {/* Employee subtotal */}
-                                                                    <div className="flex items-center justify-between px-5 py-3 bg-slate-700/20">
-                                                                        <span className="text-slate-400 text-xs uppercase tracking-wider font-semibold">{entries.length} shift{entries.length!==1?'s':''}</span>
-                                                                        <div className="flex items-center gap-6">
-                                                                            <span className="text-white font-semibold">{fmtDuration(mins)}</span>
-                                                                        </div>
-                                                                    </div>
-                                                                </div>
-                                                            )}
-                                                        </div>
-                                                    ))}
-
-                                                </div>
-                                            );
-                                        })()}
-
-                                    </div>
-                                );
-                            })()}
                             {/* Manage Employees & Tasks View */}
                             {ownerDashboardView === 'manage' && (
                                 <>
@@ -3814,41 +3761,6 @@
                                         className="px-4 py-3 bg-slate-900/50 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-amber-500/50"
                                         required
                                     />
-                                    <div className="flex items-center gap-3 px-4 py-3 bg-slate-900/50 border border-slate-700 rounded-lg">
-                                        <span className="text-slate-300 text-sm flex-1">Hourly paid?</span>
-                                        <button
-                                            type="button"
-                                            onClick={() => setNewEmployee({ ...newEmployee, isHourly: !newEmployee.isHourly, hourlyRate: '' })}
-                                            className={`relative w-11 h-6 rounded-full transition-colors ${newEmployee.isHourly ? 'bg-green-500' : 'bg-slate-600'}`}
-                                        >
-                                            <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${newEmployee.isHourly ? 'translate-x-5' : ''}`}></span>
-                                        </button>
-                                    </div>
-                                    <div className="flex items-center gap-3 px-4 py-3 bg-slate-900/50 border border-slate-700 rounded-lg">
-                                        <span className="text-slate-300 text-sm flex-1">Clock-In Alert?</span>
-                                        <button
-                                            type="button"
-                                            onClick={() => setNewEmployee({ ...newEmployee, clockInAlert: !newEmployee.clockInAlert })}
-                                            className={`relative w-11 h-6 rounded-full transition-colors ${newEmployee.clockInAlert ? 'bg-amber-500' : 'bg-slate-600'}`}
-                                        >
-                                            <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${newEmployee.clockInAlert ? 'translate-x-5' : ''}`}></span>
-                                        </button>
-                                    </div>
-                                    {newEmployee.isHourly && (
-                                        <div className="flex items-center bg-slate-900/50 border border-slate-700 rounded-lg overflow-hidden">
-                                            <span className="px-3 py-3 text-slate-400 text-sm border-r border-slate-700">$</span>
-                                            <input
-                                                type="number"
-                                                step="0.01"
-                                                min="0"
-                                                placeholder="Hourly rate"
-                                                value={newEmployee.hourlyRate}
-                                                onChange={(e) => setNewEmployee({ ...newEmployee, hourlyRate: e.target.value })}
-                                                className="flex-1 px-3 py-3 bg-transparent text-white placeholder-slate-500 focus:outline-none"
-                                            />
-                                            <span className="px-3 text-slate-400 text-sm">/hr</span>
-                                        </div>
-                                    )}
                                     <button
                                         type="submit"
                                         className="bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-400 hover:to-orange-500 text-white font-semibold py-3 rounded-lg transition-all"
@@ -3975,12 +3887,8 @@
                                                                                 closingTime: editFormData.closingTime,
                                                                                 timezone: editFormData.timezone
                                                                             },
-                                                                            assignedBreakMinutes: parseInt(editFormData.assignedBreakMinutes) || 30,
-                                                                            isHourly: editFormData.isHourly || false,
-                                                                            clockInAlert: editFormData.clockInAlert || false,
-                                                                            breakStartTime: editFormData.breakStartTime || '',
-                                                                            breakEndTime: editFormData.breakEndTime || '',
-                                                                            hourlyRate: editFormData.isHourly ? (parseFloat(editFormData.hourlyRate) || 0) : 0
+                                                                            alertsEnabled: !!editFormData.alertsEnabled,
+                                                                            alertRecipients: editFormData.alertRecipients || 'owner'
                                                                         })}
                                                                         className="px-3 py-1 bg-green-600 hover:bg-green-500 text-white rounded transition-colors"
                                                                     >
@@ -4083,39 +3991,6 @@
                                                                             />
                                                                         </div>
                                                                         <div>
-                                                                            <label className="text-slate-400 text-xs mb-1 block">Break Time</label>
-                                                                            <select
-                                                                                value={editFormData.assignedBreakMinutes || 30}
-                                                                                onChange={(e) => setEditFormData({...editFormData, assignedBreakMinutes: parseInt(e.target.value)})}
-                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
-                                                                            >
-                                                                                <option value="15">15 min</option>
-                                                                                <option value="30">30 min</option>
-                                                                                <option value="45">45 min</option>
-                                                                                <option value="60">1 hour</option>
-                                                                                <option value="90">1.5 hours</option>
-                                                                                <option value="120">2 hours</option>
-                                                                            </select>
-                                                                        </div>
-                                                                        <div>
-                                                                            <label className="text-slate-400 text-xs mb-1 block">Break Start</label>
-                                                                            <input
-                                                                                type="time"
-                                                                                value={editFormData.breakStartTime || ''}
-                                                                                onChange={(e) => setEditFormData({...editFormData, breakStartTime: e.target.value})}
-                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
-                                                                            />
-                                                                        </div>
-                                                                        <div>
-                                                                            <label className="text-slate-400 text-xs mb-1 block">Break End</label>
-                                                                            <input
-                                                                                type="time"
-                                                                                value={editFormData.breakEndTime || ''}
-                                                                                onChange={(e) => setEditFormData({...editFormData, breakEndTime: e.target.value})}
-                                                                                className="w-full px-3 py-2 bg-slate-900/50 border border-slate-600 rounded text-white text-sm"
-                                                                            />
-                                                                        </div>
-                                                                        <div>
                                                                             <label className="text-slate-400 text-xs mb-1 block">Timezone</label>
                                                                             <select
                                                                                 value={editFormData.timezone || 'America/Toronto'}
@@ -4168,47 +4043,26 @@
                                                                 </div>
 
                                                                 <div className="bg-slate-900/30 p-3 rounded-lg">
-                                                                    <label className="text-slate-300 text-xs font-semibold mb-2 block">Pay Type</label>
-                                                                    <div className="flex items-center justify-between mb-3">
-                                                                        <span className="text-slate-400 text-sm">Paid hourly?</span>
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={() => setEditFormData({...editFormData, isHourly: !editFormData.isHourly, hourlyRate: editFormData.hourlyRate || ''})}
-                                                                            className={`relative w-11 h-6 rounded-full transition-colors ${editFormData.isHourly ? 'bg-green-500' : 'bg-slate-600'}`}
-                                                                        >
-                                                                            <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${editFormData.isHourly ? 'translate-x-5' : ''}`}></span>
-                                                                        </button>
-                                                                    </div>
-                                                                    <div className="flex items-center justify-between mt-3">
-                                                                        <span className="text-slate-400 text-sm">Clock-In Alert?</span>
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={() => setEditFormData({...editFormData, clockInAlert: !editFormData.clockInAlert})}
-                                                                            className={`relative w-11 h-6 rounded-full transition-colors ${editFormData.clockInAlert ? 'bg-amber-500' : 'bg-slate-600'}`}
-                                                                        >
-                                                                            <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${editFormData.clockInAlert ? 'translate-x-5' : ''}`}></span>
-                                                                        </button>
-                                                                    </div>
-                                                                    <p className="text-slate-500 text-xs mt-1">Send you an email if this employee doesn't clock in within 5 min of shift start</p>
-                                                                    {editFormData.isHourly && (
+                                                                    <label className="text-slate-300 text-xs font-semibold mb-3 block">
+                                                                        Late Alerts
+                                                                    </label>
+
+                                                                    {/* Toggle: Master ON/OFF for this employee's alerts */}
+                                                                    <div className="flex items-center justify-between">
                                                                         <div>
-                                                                            <label className="text-slate-400 text-xs mb-1 block">Hourly Rate (CAD $)</label>
-                                                                            <div className="flex items-center bg-slate-900/50 border border-slate-600 rounded overflow-hidden">
-                                                                                <span className="px-3 py-2 text-slate-400 text-sm border-r border-slate-600">$</span>
-                                                                                <input
-                                                                                    type="number"
-                                                                                    step="0.01"
-                                                                                    min="0"
-                                                                                    value={editFormData.hourlyRate || ''}
-                                                                                    onChange={(e) => setEditFormData({...editFormData, hourlyRate: e.target.value})}
-                                                                                    className="flex-1 px-3 py-2 bg-transparent text-white text-sm focus:outline-none"
-                                                                                    placeholder="e.g. 17.20"
-                                                                                />
-                                                                                <span className="px-3 py-2 text-slate-400 text-sm">/hr</span>
-                                                                            </div>
-                                                                            <p className="text-slate-500 text-xs mt-1">Pay = (hours worked − break) × rate</p>
+                                                                            <span className="text-slate-300 text-sm">Send alerts for this employee</span>
+                                                                            <p className="text-slate-500 text-xs mt-0.5">
+                                                                                Notify owner via WhatsApp when they don't clock in/out within 5 min of their shift
+                                                                            </p>
                                                                         </div>
-                                                                    )}
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => setEditFormData({...editFormData, alertsEnabled: !editFormData.alertsEnabled})}
+                                                                            className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${editFormData.alertsEnabled ? 'bg-amber-500' : 'bg-slate-600'}`}
+                                                                        >
+                                                                            <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${editFormData.alertsEnabled ? 'translate-x-5' : ''}`}></span>
+                                                                        </button>
+                                                                    </div>
                                                                 </div>
                                                             </div>
                                                         ) : (
@@ -4235,21 +4089,9 @@
                                                                     </span>
                                                                 </span>
                                                                 <span className="text-slate-400 w-full">
-                                                                    Break Time: 
-                                                                    <span className="text-white font-medium ml-2">
-                                                                        {employee.assignedBreakMinutes || 30} minutes
-                                                                    </span>
-                                                                </span>
-                                                                <span className="text-slate-400 w-full">
-                                                                    Clock-In Alert:
-                                                                    <span className={`font-medium ml-2 ${employee.clockInAlert ? 'text-amber-400' : 'text-slate-500'}`}>
-                                                                        {employee.clockInAlert ? '🔔 Enabled' : 'Off'}
-                                                                    </span>
-                                                                </span>
-                                                                <span className="text-slate-400 w-full">
-                                                                    Pay Type:
-                                                                    <span className={`font-medium ml-2 ${employee.isHourly ? 'text-green-400' : 'text-slate-300'}`}>
-                                                                        {employee.isHourly ? `Hourly — $${(employee.hourlyRate || 0).toFixed(2)}/hr` : 'Salaried / not tracked'}
+                                                                    Late Alerts: 
+                                                                    <span className={`font-medium ml-2 ${employee.alertsEnabled ? 'text-amber-400' : 'text-slate-500'}`}>
+                                                                        {employee.alertsEnabled ? '🔔 ON' : 'Off'}
                                                                     </span>
                                                                 </span>
                                                                 <span className="text-slate-400 w-full">
@@ -4307,12 +4149,8 @@
                                                                         openingTime: employee.schedule?.openingTime || '09:00',
                                                                         closingTime: employee.schedule?.closingTime || '17:00',
                                                                         timezone: employee.schedule?.timezone || 'America/Toronto',
-                                                                        assignedBreakMinutes: employee.assignedBreakMinutes || 30,
-                                                                        isHourly: employee.isHourly || false,
-                                                                        clockInAlert: employee.clockInAlert || false,
-                                                                        breakStartTime: employee.breakStartTime || '',
-                                                                        breakEndTime: employee.breakEndTime || '',
-                                                                        hourlyRate: employee.hourlyRate || 0
+                                                                        alertsEnabled: !!employee.alertsEnabled,
+                                                                        alertRecipients: employee.alertRecipients || 'owner'
                                                                     });
                                                                 }}
                                                                 className="p-2 bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 rounded-lg transition-all"
@@ -5624,12 +5462,32 @@
                                     </div>
                                 </>
                             )}
+
                         </div>
                     </div>
                 )}
+
+                            {ownerDashboardView === 'live' && (
+                                <LiveStatusView employees={employees} />
+                            )}
+
+                            {ownerDashboardView === 'history' && (
+                                <WorkHistoryView
+                                    employees={employees}
+                                    setEmployees={setEmployees}
+                                    useFirebase={useFirebase}
+                                    db={db}
+                                />
+                            )}
             </div>
         </div>
     );
+}
+
+// My Work History (employee-facing read-only view)
+if (currentView === 'myWorkHistory') {
+    if (!currentEmployee) return null;
+    return <MyWorkHistoryView employee={currentEmployee} onBack={() => setCurrentView('employeeDashboard')} />;
 }
 
 // Employee Dashboard
@@ -5661,11 +5519,14 @@ if (currentView === 'employeeDashboard') {
                                         )}
                                     </button>
                                     <button
-                                        onClick={() => setEmployeeView(v => v === 'shifts' ? 'dashboard' : 'shifts')}
-                                        className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all font-medium text-sm ${employeeView === 'shifts' ? 'bg-blue-600 text-white' : 'bg-slate-700/50 text-white hover:bg-slate-700'}`}
+                                        onClick={() => setCurrentView('myWorkHistory')}
+                                        className="flex items-center gap-2 px-4 py-2 bg-slate-700/50 hover:bg-gradient-to-r hover:from-emerald-500 hover:to-teal-600 text-white rounded-lg transition-all hover:shadow-lg font-semibold"
+                                        title="View my work history"
                                     >
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
-                                        Work History
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                                            <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+                                        </svg>
+                                        My Hours
                                     </button>
                                     <a
                                         href="https://amandeepsin.github.io/customer-call-logs-portal/"
@@ -5684,7 +5545,7 @@ if (currentView === 'employeeDashboard') {
                                         className="flex items-center gap-2 px-4 py-2 bg-red-600/80 hover:bg-red-600 text-white rounded-lg transition-all font-semibold"
                                     >
                                         <LogOut size={18} />
-                                        End Shift & Sign Out
+                                        Sign Out
                                     </button>
                                 </div>
                             </div>
@@ -5697,173 +5558,6 @@ if (currentView === 'employeeDashboard') {
                                     {error}
                                 </div>
                             )}
-                            
-
-
-                            {/* ── MY SHIFTS VIEW ── */}
-                            {employeeView === 'shifts' && (() => {
-                                const emp = currentEmployee;
-                                // Dedupe by clockIn timestamp to suppress any duplicate auto-out entries
-                                const seen = new Set();
-                                const history = (emp.workHistory || [])
-                                    .filter(e => {
-                                        const k = (e.clockIn || '') + '_' + (e.clockOut || '');
-                                        if (seen.has(k)) return false;
-                                        seen.add(k);
-                                        return true;
-                                    })
-                                    .slice().sort((a,b) => new Date(b.date) - new Date(a.date));
-                                // Display in EMPLOYEE's timezone via TimeUtil
-                                const fmtDate = (iso) => TimeUtil.formatEmployeeDate(emp, iso);
-                                const fmtTime = (iso) => TimeUtil.formatEmployeeTime(emp, iso);
-                                const fmtDur  = (mins) => TimeUtil.formatDuration(mins);
-                                const now = new Date();
-                                const totalMonthMins = history.filter(e => {
-                                    const d = new Date(e.date);
-                                    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-                                }).reduce((s,e) => s + (e.paidMinutes||0), 0);
-                                const totalMins = history.reduce((s,e) => s + (e.paidMinutes||0), 0);
-                                const avgMins = history.length > 0 ? Math.round(totalMins / history.length) : 0;
-                                return (
-                                    <div className="max-w-5xl mx-auto px-6 py-6">
-                                        <div className="grid grid-cols-3 gap-3 mb-5">
-                                            <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-3">
-                                                <div className="text-slate-400 text-xs mb-1">This month</div>
-                                                <div className="text-white font-semibold text-lg">{fmtDur(totalMonthMins)}</div>
-                                            </div>
-                                            <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-3">
-                                                <div className="text-slate-400 text-xs mb-1">Total shifts</div>
-                                                <div className="text-white font-semibold text-lg">{history.length}</div>
-                                            </div>
-                                            <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 p-3">
-                                                <div className="text-slate-400 text-xs mb-1">Avg shift</div>
-                                                <div className="text-white font-semibold text-lg">{fmtDur(avgMins)}</div>
-                                            </div>
-                                        </div>
-                                        {history.length === 0 ? (
-                                            <div className="text-center py-12 text-slate-500">No shifts recorded yet</div>
-                                        ) : (
-                                            <div className="bg-slate-800/50 rounded-xl border border-slate-700/50 overflow-hidden">
-                                                {history.map((entry, idx) => (
-                                                    <div key={entry.id || idx} className="flex items-center gap-3 px-4 py-2.5 border-b border-slate-700/30 last:border-b-0">
-                                                        <span className="text-slate-400 text-xs w-20 flex-shrink-0">{fmtDate(entry.date)}</span>
-                                                        <span className="text-slate-300 text-xs flex-1 truncate">{fmtTime(entry.clockIn)} – {fmtTime(entry.clockOut)} · {entry.breakMinutes||0}m break</span>
-                                                        {entry.autoClockOut && <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-400 flex-shrink-0">auto</span>}
-                                                        {entry.edited && <span className="text-xs px-1.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-400 flex-shrink-0">edited</span>}
-                                                        <span className={`text-xs font-semibold flex-shrink-0 w-12 text-right ${(entry.paidMinutes||0) > 0 ? 'text-green-400' : 'text-slate-500'}`}>{fmtDur(entry.paidMinutes||0)}</span>
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
-                                );
-                            })()}
-
-                            <div style={{display: employeeView === 'shifts' ? 'none' : 'block'}}>
-
-                            {/* ── CLOCK IN / OUT CARD ── */}
-                            {(() => {
-                                const emp = currentEmployee;
-                                if (!emp) return null;
-                                // If not clocked in, show a "Clock In" card instead of the running shift card.
-                                // This handles the case where the owner force-clocked them out and they need
-                                // to clock back in for a new shift.
-                                if (!emp.clockedIn) {
-                                    return (
-                                        <div className="mb-6 bg-slate-800/50 backdrop-blur-xl border border-slate-700/50 rounded-2xl p-6 text-center">
-                                            <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-slate-700/50 mb-3">
-                                                <Clock size={22} className="text-slate-400" />
-                                            </div>
-                                            <h3 className="text-white text-lg font-bold mb-1">Not clocked in</h3>
-                                            <p className="text-slate-400 text-sm mb-4">
-                                                {emp.schedule?.openingTime && emp.schedule?.closingTime
-                                                    ? `Your shift: ${TimeUtil.format12h(emp.schedule.openingTime)} – ${TimeUtil.format12h(emp.schedule.closingTime)}`
-                                                    : 'Click below to start your shift'}
-                                            </p>
-                                            <button
-                                                onClick={handleClockIn}
-                                                className="px-6 py-2.5 bg-green-600 hover:bg-green-500 text-white rounded-lg font-semibold transition-all"
-                                            >
-                                                Clock In
-                                            </button>
-                                        </div>
-                                    );
-                                }
-                                // Card always renders when emp exists — clockedIn may be briefly false on first render
-
-                                // clockTick drives the 1-second re-render — do not remove
-                                void clockTick;
-
-                                const now = new Date();
-                                // Live elapsed + earned (updates every second via clockTick)
-                                const grossMin = emp.clockedIn && emp.clockInTime ? TimeUtil.minutesBetween(emp.clockInTime, now.toISOString()) : 0;
-                                const paidMin  = Math.max(0, grossMin - (emp.assignedBreakMinutes || 0));
-                                // Display formatters route through TimeUtil so times render in employee TZ
-                                const fmt12 = (t) => TimeUtil.format12h(t);
-                                const fmtT  = (iso) => TimeUtil.formatEmployeeTime(emp, iso);
-
-                                return (
-                                    <div className="mb-6">
-
-                                        {/* Late banner */}
-                                        {emp.isLateToday && emp.minutesLate > 0 && (
-                                            <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl px-4 py-3 mb-4 flex items-center gap-3">
-                                                <svg className="w-4 h-4 text-amber-400 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01" strokeLinecap="round"/></svg>
-                                                <p className="text-amber-400 text-sm">
-                                                    <span className="font-semibold">You were {emp.minutesLate} min late.</span>
-                                                    <span className="text-amber-300/70 ml-1">Shift started at {emp.schedule?.openingTime}.</span>
-                                                </p>
-                                            </div>
-                                        )}
-
-                                        {/* Main card */}
-                                        <div className="bg-gradient-to-br from-slate-800/80 to-slate-900/80 border border-green-500/25 rounded-2xl overflow-hidden shadow-xl">
-
-                                            {/* Green top bar */}
-                                            <div className="flex items-center gap-2 px-5 py-3 bg-green-600/15 border-b border-green-500/20">
-                                                <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
-                                                <span className="text-green-400 text-sm font-semibold">Clocked In</span>
-                                                <span className="ml-auto text-slate-400 text-xs">
-                                                    {emp.schedule?.openingTime || '?'} – {emp.schedule?.closingTime || '?'}
-                                                    {emp.schedule?.timezone ? ` · ${emp.schedule?.timezone?.split('/')[1]?.replace('_',' ')}` : ''}
-                                                </span>
-                                            </div>
-
-                                            {/* Stats row */}
-                                            <div className="grid grid-cols-2 divide-x divide-slate-700/50 border-b border-slate-700/40 wf-clock-card-stats">
-                                                <div className="px-5 py-4">
-                                                    <div className="text-slate-400 text-xs uppercase tracking-wider mb-1">Clocked In</div>
-                                                    <div className="text-white text-xl font-bold">{fmtT(emp.clockInTime)}</div>
-                                                </div>
-
-                                                <div className="px-5 py-4">
-                                                    <div className="text-slate-400 text-xs uppercase tracking-wider mb-1">Your Break</div>
-                                                    <div className="text-blue-400 text-xl font-bold">
-                                                        {emp.breakStartTime && emp.breakEndTime
-                                                            ? `${fmt12(emp.breakStartTime)} – ${fmt12(emp.breakEndTime)}`
-                                                            : emp.assignedBreakMinutes
-                                                                ? `${emp.assignedBreakMinutes} min`
-                                                                : 'Not set'}
-                                                    </div>
-                                                </div>
-                                            </div>
-
-
-
-                                            {/* Footer — info only */}
-                                            <div className="px-5 py-3">
-                                                <div className="text-slate-500 text-xs">
-                                                    {emp.assignedBreakMinutes > 0 && (
-                                                        <span>{emp.assignedBreakMinutes}m break deducted from paid hours · </span>
-                                                    )}
-                                                    Auto clock-out at {emp.schedule?.closingTime ? fmt12(emp.schedule?.closingTime) : 'closing time'}
-                                                </div>
-                                            </div>
-
-                                        </div>
-                                    </div>
-                                );
-                            })()}
                             <div className="grid md:grid-cols-2 gap-6">
                                         <div className="bg-slate-800/50 backdrop-blur-xl rounded-2xl shadow-xl p-6 border border-slate-700/50">
                                             <div className="flex items-center justify-between mb-6">
@@ -6179,7 +5873,6 @@ if (currentView === 'employeeDashboard') {
                                     </div>
                                 </div>
                                 
-                            </div>
                             </div>
 
                 );
