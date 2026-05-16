@@ -1365,7 +1365,8 @@
                                                     <td className="py-2 px-2 text-slate-200">
                                                         {fmtDate(entry.shift.clockIn || entry.shift.date)}
                                                         {entry.shift.manualEntry && <span className="ml-2 px-1.5 py-0.5 bg-blue-500/20 text-blue-300 text-[10px] rounded">manual</span>}
-                                                        {entry.shift.editedAt && !entry.shift.manualEntry && <span className="ml-2 px-1.5 py-0.5 bg-amber-500/20 text-amber-300 text-[10px] rounded">edited</span>}
+                                                        {entry.shift.forcedByOwner && <span className="ml-2 px-1.5 py-0.5 bg-orange-500/20 text-orange-300 text-[10px] rounded" title={entry.shift.forcedReason || 'Force clocked out by owner'}>forced</span>}
+                                                        {entry.shift.editedAt && !entry.shift.manualEntry && !entry.shift.forcedByOwner && <span className="ml-2 px-1.5 py-0.5 bg-amber-500/20 text-amber-300 text-[10px] rounded">edited</span>}
                                                     </td>
                                                     <td className="py-2 px-2 text-slate-300 font-mono text-xs">{fmtTime(entry.shift.clockIn)}</td>
                                                     <td className="py-2 px-2 text-slate-300 font-mono text-xs">{fmtTime(entry.shift.clockOut)}</td>
@@ -1478,13 +1479,141 @@
         // the parent `employees` state changes (via Firebase listener).
         // The elapsed-time counter ticks every 30 seconds.
         // ════════════════════════════════════════════════════════════════
-        const LiveStatusView = ({ employees }) => {
+        const LiveStatusView = ({ employees, setEmployees, useFirebase, db }) => {
             // Re-render every second so the elapsed counter ticks live.
             const [, setTick] = useState(0);
             useEffect(() => {
                 const id = setInterval(() => setTick(t => t + 1), 1000);
                 return () => clearInterval(id);
             }, []);
+
+            // ── Force clock-out state ──
+            const [forceEmp, setForceEmp] = useState(null);       // employee being clocked out
+            const [forceTime, setForceTime] = useState('');       // HH:MM
+            const [forceReason, setForceReason] = useState('');
+            const [forceSaving, setForceSaving] = useState(false);
+            const [forceError, setForceError] = useState('');
+
+            const openForceModal = (emp) => {
+                setForceEmp(emp);
+                // Pre-fill with scheduled closing time, fall back to current time
+                const sched = emp.schedule?.closingTime || '';
+                if (sched) {
+                    setForceTime(sched);
+                } else {
+                    const now = new Date();
+                    setForceTime(String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0'));
+                }
+                setForceReason('');
+                setForceError('');
+            };
+            const closeForceModal = () => {
+                setForceEmp(null);
+                setForceTime('');
+                setForceReason('');
+                setForceError('');
+            };
+
+            const submitForceClockOut = async () => {
+                if (!forceEmp || !forceTime) {
+                    setForceError('Please choose a clock-out time.');
+                    return;
+                }
+                if (forceSaving) return;
+                setForceSaving(true);
+                setForceError('');
+
+                try {
+                    const emp = forceEmp;
+                    const clockInISO = emp.clockInTime;
+                    if (!clockInISO) {
+                        setForceError('No clock-in time on record for this employee.');
+                        setForceSaving(false);
+                        return;
+                    }
+                    // Build clock-out Date: anchor to clock-in date, then set HH:MM.
+                    // If chosen time is earlier than clock-in (overnight shift), roll
+                    // forward by one day.
+                    const [h, m] = forceTime.split(':').map(Number);
+                    const inDate = new Date(clockInISO);
+                    let outDate = new Date(inDate);
+                    outDate.setHours(h, m, 0, 0);
+                    if (outDate <= inDate) {
+                        outDate.setDate(outDate.getDate() + 1);
+                    }
+
+                    const grossMin = (outDate - inDate) / 60000;
+                    if (grossMin > 24 * 60) {
+                        setForceError('Clock-out is more than 24 hours after clock-in. Pick a different time.');
+                        setForceSaving(false);
+                        return;
+                    }
+                    if (grossMin > 12 * 60) {
+                        // 12h+ — warn but allow
+                        if (!confirm('This shift would be longer than 12 hours. Continue?')) {
+                            setForceSaving(false);
+                            return;
+                        }
+                    }
+
+                    const paidHours = parseFloat((grossMin / 60).toFixed(2));
+                    const rate = emp.hourlyRate || 0;
+                    const pay = parseFloat((paidHours * rate).toFixed(2));
+
+                    const entry = {
+                        id: Date.now() + Math.random(),
+                        date: outDate.toISOString(),
+                        clockIn: clockInISO,
+                        clockOut: outDate.toISOString(),
+                        clockInPhoto: emp.clockInPhoto || null,
+                        photoMissingIn: !!emp.photoMissingIn,
+                        clockOutPhoto: null,
+                        photoMissingOut: true,   // owner force-clocked, no live capture
+                        grossMinutes: Math.round(grossMin),
+                        paidMinutes: Math.round(grossMin),
+                        paidHours,
+                        hourlyRate: rate,
+                        pay,
+                        wasLate: emp.isLateToday || false,
+                        minutesLate: emp.minutesLate || 0,
+                        forcedByOwner: true,
+                        forcedAt: new Date().toISOString(),
+                        forcedReason: forceReason.trim() || null
+                    };
+
+                    const newHistory = [...(emp.workHistory || []), entry];
+                    const updatedEmp = {
+                        ...emp,
+                        clockedIn: false,
+                        clockOutTime: outDate.toISOString(),
+                        workHistory: newHistory,
+                        clockInPhoto: null,
+                        photoMissingIn: false,
+                        isLateToday: false,
+                        minutesLate: 0
+                    };
+
+                    setEmployees(employees.map(e => e.id === emp.id ? updatedEmp : e));
+
+                    if (useFirebase && db) {
+                        await db.collection('employees').doc(emp.id.toString()).update({
+                            clockedIn: false,
+                            clockOutTime: outDate.toISOString(),
+                            workHistory: newHistory,
+                            clockInPhoto: null,
+                            photoMissingIn: false,
+                            isLateToday: false,
+                            minutesLate: 0
+                        });
+                    }
+                    closeForceModal();
+                } catch (err) {
+                    console.error('Force clock-out failed:', err);
+                    setForceError('Failed to save. Check console for details.');
+                } finally {
+                    setForceSaving(false);
+                }
+            };
 
             const clockedIn = (employees || [])
                 .filter(e => e.clockedIn && e.clockInTime)
@@ -1560,12 +1689,102 @@
                                             )}
                                         </div>
                                     </div>
-                                    <div className="text-right flex-shrink-0">
-                                        <div className="text-emerald-400 text-2xl font-bold tabular-nums">{fmtElapsed(emp.clockInTime)}</div>
-                                        <div className="text-slate-500 text-xs">elapsed</div>
+                                    <div className="text-right flex-shrink-0 flex flex-col items-end gap-2">
+                                        <div>
+                                            <div className="text-emerald-400 text-2xl font-bold tabular-nums">{fmtElapsed(emp.clockInTime)}</div>
+                                            <div className="text-slate-500 text-xs">elapsed</div>
+                                        </div>
+                                        <button
+                                            onClick={() => openForceModal(emp)}
+                                            className="px-3 py-1.5 text-xs font-semibold bg-amber-600/30 hover:bg-amber-600 text-amber-200 hover:text-white rounded-lg transition-colors border border-amber-600/40"
+                                            title="Manually clock this employee out"
+                                        >
+                                            Force clock out
+                                        </button>
                                     </div>
                                 </div>
                             ))}
+                        </div>
+                    )}
+
+                    {/* Force clock-out modal */}
+                    {forceEmp && (
+                        <div
+                            onClick={closeForceModal}
+                            className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+                        >
+                            <div
+                                onClick={(e) => e.stopPropagation()}
+                                className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl p-6 max-w-md w-full"
+                            >
+                                <div className="flex items-center justify-between mb-4">
+                                    <h3 className="text-xl font-bold text-white">Force clock out</h3>
+                                    <button
+                                        onClick={closeForceModal}
+                                        className="text-slate-400 hover:text-white text-2xl leading-none"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+
+                                <div className="bg-slate-900/40 rounded-lg p-3 border border-slate-700/50 mb-4">
+                                    <div className="text-white font-semibold">{forceEmp.name}</div>
+                                    <div className="text-slate-400 text-xs mt-1">
+                                        Clocked in {' '}
+                                        <span className="text-slate-300 font-mono">
+                                            {new Date(forceEmp.clockInTime).toLocaleString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })}
+                                        </span>
+                                    </div>
+                                </div>
+
+                                <div className="mb-4">
+                                    <label className="text-slate-400 text-xs mb-1 block uppercase tracking-wide">Actual clock-out time</label>
+                                    <input
+                                        type="time"
+                                        value={forceTime}
+                                        onChange={(e) => setForceTime(e.target.value)}
+                                        className="w-full px-3 py-2 bg-slate-900/70 border border-slate-600 rounded-lg text-white text-sm font-mono"
+                                    />
+                                    <p className="text-slate-500 text-xs mt-2">
+                                        Pre-filled with their scheduled end time. Change if they left earlier or later.
+                                    </p>
+                                </div>
+
+                                <div className="mb-4">
+                                    <label className="text-slate-400 text-xs mb-1 block uppercase tracking-wide">Reason (optional)</label>
+                                    <input
+                                        type="text"
+                                        value={forceReason}
+                                        onChange={(e) => setForceReason(e.target.value)}
+                                        placeholder="e.g. Employee forgot to clock out"
+                                        maxLength="120"
+                                        className="w-full px-3 py-2 bg-slate-900/70 border border-slate-600 rounded-lg text-white text-sm"
+                                    />
+                                </div>
+
+                                {forceError && (
+                                    <div className="mb-4 px-3 py-2 bg-red-500/10 border border-red-500/30 rounded-lg text-red-300 text-xs">
+                                        {forceError}
+                                    </div>
+                                )}
+
+                                <div className="flex gap-2 justify-end">
+                                    <button
+                                        onClick={closeForceModal}
+                                        disabled={forceSaving}
+                                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white text-sm rounded-lg"
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={submitForceClockOut}
+                                        disabled={forceSaving}
+                                        className="px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white text-sm font-semibold rounded-lg"
+                                    >
+                                        {forceSaving ? 'Saving…' : 'Clock out & save shift'}
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     )}
                 </div>
@@ -5489,7 +5708,7 @@
                 )}
 
                             {ownerDashboardView === 'live' && (
-                                <LiveStatusView employees={employees} />
+                                <LiveStatusView employees={employees} setEmployees={setEmployees} useFirebase={useFirebase} db={db} />
                             )}
 
                             {ownerDashboardView === 'history' && (
