@@ -4,9 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Employee Management System</title>
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Pinned versions — DO NOT switch back to floating "@18" or "@babel/standalone" without a version.
+         Floating CDN URLs auto-update and broke all portals when Babel changed the JSX runtime default. -->
+    <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.0/jspdf.plugin.autotable.min.js"></script>
     <style>
@@ -313,7 +315,11 @@
 <body>
     <div id="root"></div>
     
-    <script type="text/babel">
+    <script type="text/babel" data-presets="env,react">
+        /** @jsxRuntime classic */
+        // ↑ Forces Babel to use classic JSX (React.createElement) instead of the
+        //   automatic runtime, which would inject `import { jsx } from "react/jsx-runtime"`
+        //   and break this non-module script. Do not remove.
         const { useState, useEffect } = React;
         
         // Firebase Configuration
